@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cumulative-agent"
+version = "0.1.0"
+description = "Bounded task-first autonomous maintenance service"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.27,<1", "pydantic>=2.8,<3", "PyYAML>=6,<7"]
+
+[project.scripts]
+cumulative-agent = "cumulative_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cumulative_agent = ["dashboard.html", "web/*.html", "web/*.css", "web/*.js", "web/*.mjs"]

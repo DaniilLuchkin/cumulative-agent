@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Мои задачи</title>
+  <link rel="stylesheet" href="/app/assets/app.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script type="module" src="/app/assets/app.js"></script>
+</head>
+<body>
+  <svg class="icon-definitions" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h12M9 12h12M9 18h12M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="3"/><path d="M16 3v4M8 3v4M3 11h18"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-agent" viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="14" rx="4"/><path d="M12 3v4M8 12h.01M16 12h.01M8 17h8"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></symbol>
+    <symbol id="i-flag" viewBox="0 0 24 24"><path d="M5 21V3m0 1h12l-2 4 2 4H5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-resources" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+  </svg>
+
+  <main id="login-screen" class="login-screen">
+    <div class="login-card">
+      <span class="brand-mark"><svg class="icon"><use href="#i-check"/></svg></span>
+      <p class="eyebrow">CUMULATIVE AGENT</p>
+      <h1>Мои задачи</h1>
+      <p class="muted">Всё, что важно.<br>Дедлайны, приоритеты и ваш агент рядом.</p>
+      <p id="login-message" class="login-message" role="status">Откройте приложение из бота или войдите с токеном доступа.</p>
+      <form id="login-form">
+        <label for="access-token">Токен доступа</label>
+        <input id="access-token" type="password" autocomplete="off" required placeholder="Только для входа в браузере">
+        <button class="button primary" type="submit">Открыть задачи</button>
+      </form>
+      <p class="privacy-note">Токен хранится только до закрытия страницы.</p>
+    </div>
+  </main>
+
+  <div id="workspace" class="workspace" hidden>
+    <aside class="sidebar">
+      <div class="brand-row"><a class="brand" href="/app"><span class="brand-mark"><svg class="icon"><use href="#i-check"/></svg></span><span>Мои задачи<small>Cumulative Agent</small></span></a><button id="mobile-resources" type="button" aria-pressed="false"><svg class="icon"><use href="#i-resources"/></svg>Ресурсы</button></div>
+      <p class="nav-label">Задачи</p>
+      <nav id="views" aria-label="Списки задач">
+        <button class="nav-item active" data-view="active"><svg class="icon"><use href="#i-list"/></svg><span>Активные</span><b data-count="active">0</b></button>
+        <button class="nav-item" data-view="today"><svg class="icon"><use href="#i-calendar"/></svg><span>Сегодня</span><b data-count="today">0</b></button>
+        <button class="nav-item" data-view="overdue"><svg class="icon"><use href="#i-clock"/></svg><span>Просроченные</span><b data-count="overdue">0</b></button>
+        <button class="nav-item" data-view="done"><svg class="icon"><use href="#i-check"/></svg><span>Завершённые</span><b data-count="done">0</b></button>
+        <button class="nav-item" data-view="cancelled"><svg class="icon"><use href="#i-close"/></svg><span>Отменённые</span></button>
+        <button class="nav-item" data-view="background"><svg class="icon"><use href="#i-agent"/></svg><span>Фоновые</span><b data-count="background">0</b></button>
+        <button class="nav-item resources-nav" data-view="resources"><svg class="icon"><use href="#i-resources"/></svg><span>Ресурсы</span></button>
+      </nav>
+      <div class="sidebar-bottom"><div class="agent-note"><span class="status-dot"></span><span id="agent-note">Пользовательские задачи — первые</span></div><button id="logout" class="link-button">Выйти</button></div>
+    </aside>
+
+    <main class="main-content">
+      <header class="page-header">
+        <div><p id="today-label" class="eyebrow"></p><h1 id="view-title">Активные задачи</h1><p id="view-subtitle" class="muted">Ваши планы, в удобном порядке.</p></div>
+        <button id="add-task" class="button primary"><svg class="icon"><use href="#i-plus"/></svg>Новая задача</button>
+        <button id="refresh-resources" class="button secondary" hidden>Обновить</button>
+      </header>
+      <section id="task-panel" aria-label="Список задач">
+      <div class="toolbar">
+        <label class="search-box"><svg class="icon"><use href="#i-search"/></svg><input id="search" type="search" placeholder="Найти задачу…" aria-label="Поиск задач"></label>
+        <select id="project-filter" aria-label="Фильтр по проекту"><option value="">Все проекты</option></select>
+        <select id="sort" aria-label="Сортировка"><option value="priority">По приоритету</option><option value="deadline">По дедлайну</option><option value="created">Сначала новые</option><option value="updated">Недавно изменённые</option></select>
+      </div>
+      <div class="list-heading"><span id="list-total">Загрузка…</span><span id="sync-status" role="status"></span></div>
+      <div id="task-list" class="task-list" aria-label="Задачи" aria-live="polite"></div>
+      <section id="empty-state" class="empty-state" hidden><span class="empty-icon"><svg class="icon"><use href="#i-check"/></svg></span><h2 id="empty-title">Здесь пока спокойно</h2><p id="empty-description" class="muted">Добавьте задачу, а агент поможет с выполнением.</p><button id="empty-add" class="button secondary">Добавить задачу</button></section>
+      <nav id="pagination" class="pagination" aria-label="Страницы списка" hidden><button id="previous-page" class="button secondary">← Назад</button><span id="page-range"></span><button id="next-page" class="button secondary">Дальше →</button></nav>
+      <p class="footer-note">Ваши задачи всегда в приоритете.</p>
+      </section>
+      <section id="resource-panel" aria-label="Ресурсы" hidden>
+        <div class="list-heading"><span>Подключения и доступные лимиты</span><span id="resources-status" role="status"></span></div>
+        <button id="sync-provider" class="button secondary" type="button">Сверить с OpenRouter API</button>
+        <div id="resources-content" aria-live="polite"></div>
+      </section>
+    </main>
+  </div>
+
+  <template id="task-template">
+    <article class="task-card">
+      <button class="completion-toggle" type="button"><svg class="icon"><use href="#i-check"/></svg></button>
+      <button class="task-content" type="button"><span class="task-title"></span><span class="task-description"></span><span class="task-meta"><span class="priority-badge"><svg class="icon"><use href="#i-flag"/></svg><span></span></span><span class="deadline-badge"><svg class="icon"><use href="#i-calendar"/></svg><span></span></span><span class="project-badge"></span></span></button>
+      <span class="task-status"></span>
+    </article>
+  </template>
+
+  <dialog id="editor" class="sheet" aria-labelledby="editor-heading">
+    <div class="sheet-header"><div><p class="eyebrow">МОИ ЗАДАЧИ</p><h2 id="editor-heading">Новая задача</h2></div><button id="close-editor" class="icon-button" aria-label="Закрыть"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <form id="task-form">
+      <label for="task-title">Что нужно сделать?</label><input id="task-title" maxlength="500" required placeholder="Например, проверить проект на баги">
+      <label for="task-description">Детали <span class="optional">необязательно</span></label><textarea id="task-description" maxlength="40000" rows="4" placeholder="Контекст, пожелания и ожидаемый результат"></textarea>
+      <div class="field-grid"><div><label for="priority-level">Приоритет</label><select id="priority-level"><option value="0">Низкий</option><option value="10" selected>Обычный</option><option value="20">Высокий</option><option value="30">Срочный</option><option value="custom">Своё значение</option></select></div><div><label for="task-project">Проект</label><select id="task-project"><option value="">Без проекта</option></select></div></div>
+      <div id="custom-priority-field" hidden><label for="priority-custom">Числовой приоритет</label><input id="priority-custom" type="number" min="-1000" max="1000" step="1" value="10"></div>
+      <label for="task-deadline">Дедлайн <span id="timezone-label" class="optional"></span></label><input id="task-deadline" type="datetime-local" step="60">
+      <div class="quick-dates"><button type="button" data-date="today">Сегодня</button><button type="button" data-date="tomorrow">Завтра</button><button type="button" data-date="clear">Без срока</button></div>
+      <div class="field-grid"><div><label for="task-recurrence">Повторять</label><select id="task-recurrence"><option value="">Не повторять</option><option value="daily">Каждый день</option><option value="weekly">Каждую неделю</option><option value="monthly">Каждый месяц</option></select></div><div><label for="task-alert">Напомнить до срока</label><select id="task-alert"><option value="0">В момент дедлайна</option><option value="15" selected>За 15 минут</option><option value="60">За час</option><option value="1440">За день</option></select></div></div>
+      <div id="new-task-options"><label for="task-execution">Выполнение</label><select id="task-execution"><option value="ready">Передать агенту</option><option value="inbox">Оставить напоминанием</option></select><label for="task-handler">Как выполнить</label><select id="task-handler"><option value="llm">Ответ модели</option><option value="coding">Анализ проекта и patch</option><option value="project_tests">Локальная проверка тестами</option></select><p class="field-note">Для работы с кодом выберите зарегистрированный проект с разрешёнными файлами и действиями.</p></div>
+      <section id="task-details" class="task-details" hidden><div id="detail-status" class="detail-status"></div><p id="blocked-reason" class="field-note"></p><div id="task-actions" class="task-actions"></div><div id="run-results"></div></section>
+      <p id="save-error" class="form-error" role="alert"></p>
+      <div class="sheet-footer"><button id="cancel-editor" type="button" class="button secondary">Отмена</button><button id="save-task" type="submit" class="button primary">Создать задачу</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

@@ -1,0 +1,24 @@
+import assert from 'node:assert/strict';
+import {deadlineForSave,toLocalInput,dayBounds,canComplete,listQuery,priorityLabel} from '../src/cumulative_agent/web/task-utils.mjs';
+
+process.env.TZ = 'Europe/Moscow';
+assert.equal(deadlineForSave('2026-10-03T15:30'),'2026-10-03T12:30:00.000Z');
+assert.equal(toLocalInput('2026-10-03T12:30:00Z'),'2026-10-03T15:30');
+assert.equal(deadlineForSave(''),null);
+assert.equal(deadlineForSave('2026-10-03T15:30','2026-10-03T12:30:45Z'),'2026-10-03T12:30:45Z');
+assert.throws(() => deadlineForSave('invalid'));
+assert.deepEqual(dayBounds(new Date('2026-10-02T01:00:00Z')),{day_start:'2026-10-01T21:00:00.000Z',day_end:'2026-10-02T21:00:00.000Z'});
+process.env.TZ = 'America/New_York';
+const spring = dayBounds(new Date('2026-03-08T12:00:00Z'));
+assert.equal((new Date(spring.day_end)-new Date(spring.day_start))/3600000,23);
+assert.throws(() => deadlineForSave('2026-03-08T02:30'));
+assert.equal(canComplete({status:'running'}),false);
+assert.equal(canComplete({status:'done',completed_manually:false}),false);
+assert.equal(canComplete({status:'done',completed_manually:true}),true);
+assert.equal(canComplete({status:'blocked',proposal_action:'merge'}),false);
+assert.equal(priorityLabel(27),'Приоритет 27');
+const query = listQuery({view:'overdue',sort:'priority',search:'a%b',project:'',offset:100});
+assert.equal(query.get('due'),'overdue');
+assert.equal(query.get('kind'),'user');
+assert.equal(query.get('offset'),'100');
+console.log('Task UI helpers: timezone, DST, clearing, original precision, controls, filters — passed');

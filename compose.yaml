@@ -1,0 +1,31 @@
+services:
+  agent:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      AGENT_CONFIG: /app/config/local.yaml
+      AGENT_DATABASE: /app/data/agent.sqlite3
+      AGENT_ALLOW_REMOTE: "1" # container binding; host port remains loopback
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./config/local.yaml:/app/config/local.yaml:ro
+      # Add opted-in project directories read-only and matching project_roots.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

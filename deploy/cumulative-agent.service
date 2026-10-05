@@ -1,0 +1,38 @@
+[Unit]
+Description=Cumulative task-first agent service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/cumulative-agent
+EnvironmentFile=/etc/cumulative-agent.env
+Environment=AGENT_CONFIG=/etc/cumulative-agent.yaml
+Environment=AGENT_DATABASE=/var/lib/cumulative-agent/agent.sqlite3
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/cumulative-agent/.venv/bin/cumulative-agent serve --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+StateDirectory=cumulative-agent
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=512M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

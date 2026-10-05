@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew cumulative-agent IP TLS certificates
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cumulative-agent-certbot/bin/certbot renew --quiet --cert-name cumulative-agent-ip
+UMask=0077
