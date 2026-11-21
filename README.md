@@ -1,23 +1,34 @@
 # Telegram LLM bot (ветка Alt)
 
-Простой LLM-чат-бот, сделанный по рекомендациям Telegram для AI-ботов
-([Bot Features → Streaming Replies, Topics in Private Chats, AI Agents](https://core.telegram.org/bots/features)).
-Без задач, очередей и Mini App. Модель вызывается через OpenRouter.
+LLM-агент для Telegram, собранный из возможностей самого Telegram
+([Bot Features → AI Agents](https://core.telegram.org/bots/features)). Модели — через OpenRouter.
 
 ## Как выглядит в Telegram
 
 | Что видит пользователь | Bot API |
 |---|---|
-| Сразу после вопроса — «Thinking…» | `sendMessageDraft` с пустым `text` |
-| Ответ набирается в реальном времени, с форматированием | `sendRichMessageDraft` (`markdown`) каждые 0,8 с; черновик обновляется раньше, чем истекут его 30 с |
-| Кнопка «Стоп» под черновиком | `can_stop: true` → update `stopped_message_generation` → вызов модели отменяется, частичный ответ сохраняется |
-| Итоговый ответ остаётся в чате: заголовки, таблицы, код | `sendRichMessage` (до 32768 символов), ответ на сообщение пользователя; при ошибке — `sendMessage` частями по 4000 |
-| Отдельные диалоги в топиках | Свой контекст у каждого топика. `/new` → `createForumTopic`. Топик, созданный в клиенте (`forum_topic_created.is_name_implicit`) или через `/new` без имени, после первого ответа получает название от модели (`editForumTopic`) |
-| Выбор модели | Глобальная команда `/settings`: inline-клавиатура с моделями и ценами из каталога OpenRouter; при нажатии сообщение редактируется на месте (`editMessageText`) |
-| Подсказки команд | `setMyCommands`: `/new`, `/reset`, `/settings`, `/help` |
+| Сразу после вопроса — «Thinking…», реакция 👀 на сообщении | `sendMessageDraft` с пустым `text`, `setMessageReaction` |
+| Ответ набирается в реальном времени; кнопка «Стоп» | `sendRichMessageDraft` (`markdown`), `can_stop` → update `stopped_message_generation` |
+| Пока агент работает инструментом — «Ставлю напоминание…» | `sendRichMessageDraft` с `<tg-thinking>` |
+| Итог — Rich Message: таблицы, task lists, `<details>`, сноски | `sendRichMessage`; при ошибке — `sendMessage` частями по 4000 |
+| Под ответом: 3 вопроса для продолжения и «🔄 Перегенерировать» | inline-клавиатура, `editMessageReplyMarkup`; вопросы предлагает `UTILITY_MODEL` |
+| Исправили своё сообщение — ответ переписывается | update `edited_message`, `deleteMessage` старого ответа |
+| «Напомни завтра в 9…» → 🫡, в срок приходит ⏰ с кнопками +15 мин / +1 час / Завтра | tool calling, бот пишет первым; время — `tg://time` (показывается в часовом поясе читателя) |
+| «Следи за …» → отдельный топик 👁 с закреплённым статусом и кнопками «Проверить сейчас / Остановить»; отчёты — в топик, только когда есть новое | `createForumTopic`, `pinChatMessage`, `editMessageText`, веб-поиск `openrouter:web_search` |
+| `/tasks` — напоминания и фоновые задачи с кнопками отмены | inline-клавиатура, правка на месте |
+| Фото, PDF, текстовые файлы, голосовые | `getFile`; фото — vision-модель (если выбранная не умеет, берётся первая из списка, которая умеет); PDF — `file-parser`; голос — `/audio/transcriptions` |
+| Отдельные диалоги в топиках, названия ставит модель | `createForumTopic`, `editForumTopic`, `forum_topic_created.is_name_implicit` |
+| `@бот вопрос` в любом чате | Inline mode: `answerInlineQuery` → `chosen_inline_result` → ответ дописывается в сообщение через `editMessageText(inline_message_id)` |
+| Упоминание `@бот` в чате, где бота нет (с контекстом сообщения, на которое ответили) | Guest Mode: update `guest_message` → `answerGuestQuery` → правка `inline_message_id` |
+| `/settings` — модель с ценой и часовой пояс | inline-клавиатура, `editMessageText` |
 
-Бот работает только в личном чате. Доступ есть у пользователей из `ALLOWED_USER_IDS`,
-а если список пуст — у первого, кто напишет боту. История хранится в SQLite; в модель
+Агенту доступны инструменты: `set_reminder`, `start_watch`, `list_scheduled`,
+`cancel_scheduled` и серверные `openrouter:web_search` / `openrouter:web_fetch`. Если
+OpenRouter отклонит серверные инструменты, бот продолжит работу без них.
+
+Диалоги — только в личном чате; inline и Guest Mode работают в любых чатах, но только для
+владельца. Доступ есть у пользователей из `ALLOWED_USER_IDS`, а если список пуст — у
+первого, кто напишет боту. История хранится в SQLite; в модель
 уходят последние сообщения общим объёмом до `HISTORY_CHARS` символов.
 
 ## Установка на Ubuntu
@@ -36,8 +47,14 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 
 * Настройки: `/etc/llm-bot.env`. После изменения: `sudo systemctl restart llm-bot`.
 * Логи: `journalctl -u llm-bot -f`.
-* Топики: в @BotFather откройте Mini App → бот → Bot Settings и включите режим топиков
-  (threaded mode). Перезапуск не нужен: `/new` перепроверяет режим через `getMe`.
+Настройки в @BotFather:
+
+| Что | Где | Без этого |
+|---|---|---|
+| Режим топиков | Mini App → настройки бота | `/new` очищает контекст вместо нового топика; наблюдения пишут в текущий чат |
+| Inline mode | `/setinline` (текст подсказки, например «вопрос…») | `@бот вопрос` не работает |
+| Inline feedback | `/setinlinefeedback` → Enabled | ответ в inline-сообщении не появится (нет `chosen_inline_result`) |
+| Guest Mode | Mini App → настройки бота → Guest Mode | бота нельзя позвать в чат, где его нет |
 
 | Переменная | По умолчанию | |
 |---|---|---|
@@ -46,6 +63,10 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 | `LLM_MODEL` | модель из старого `cumulative-agent.yaml`, иначе `openrouter/auto` | любой id с openrouter.ai/models; фактическая модель пишется в лог |
 | `LLM_MODELS` | DeepSeek V4.1 Flash, DeepSeek V4 Pro, Gemini 4 Hydrogen, GPT-6.2 Sol, Claude Fable 5.2 | список для `/settings` через запятую; `LLM_MODEL` добавляется всегда |
 | `ALLOWED_USER_IDS` | пусто | ID через запятую |
+| `UTILITY_MODEL` | `deepseek/deepseek-v4.1-flash` | названия топиков и вопросы под ответом |
+| `TRANSCRIBE_MODEL` | `openai/whisper-large-v3-turbo` | голосовые |
+| `TIMEZONE` | `Europe/Moscow` | по умолчанию; меняется в `/settings` |
+| `SUGGESTIONS` | `on` | `off` — без вопросов под ответом (на 1 запрос меньше) |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
 | `MAX_OUTPUT_TOKENS` | 4096 | |
 | `HISTORY_CHARS` | 24000 | |

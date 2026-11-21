@@ -11,7 +11,16 @@ class TelegramError(Exception):
 class Api:
     def __init__(self, token: str, client: httpx.AsyncClient):
         self.base = f"https://api.telegram.org/bot{token}/"
+        self.files = f"https://api.telegram.org/file/bot{token}/"
         self.client = client
+
+    async def download(self, file_path: str) -> bytes:
+        try:
+            response = await self.client.get(self.files + file_path, timeout=120)
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPError as exc:
+            raise TelegramError("download", type(exc).__name__) from None
 
     async def call(self, method: str, http_timeout: float = 30, **params):
         try:
