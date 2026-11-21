@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS run_evaluations(
 CREATE TABLE IF NOT EXISTS file_index(
  project_id TEXT,path TEXT,size INTEGER,mtime REAL,category TEXT,indexed_at TEXT,
  PRIMARY KEY(project_id,path));
+CREATE TABLE IF NOT EXISTS chat_messages(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER NOT NULL,thread_id INTEGER NOT NULL DEFAULT 0,
+ role TEXT NOT NULL,content TEXT NOT NULL,task_id TEXT,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS chat_thread ON chat_messages(owner_id,thread_id,id);
 """
 
 
@@ -155,7 +159,8 @@ class Repository:
         return [Model.model_validate_json(r["payload"]) for r in self.all("SELECT payload FROM models ORDER BY id")]
 
     def task_page(self, *, status: str, kind: str, project: str | None, search: str, sort: str, due: str, day_start: datetime, day_end: datetime, limit: int, offset: int) -> dict:
-        clauses, args = [], []
+        # Chat turns are conversation messages, not to-do items.
+        clauses, args = ["COALESCE(json_extract(payload,'$.handler'),'')!='chat'"], []
         if status == "active":
             clauses.append("status NOT IN ('done','cancelled')")
         elif status != "all":
@@ -183,7 +188,7 @@ class Repository:
                  "created": "created_at DESC,id", "updated": "updated_at DESC,id"}[sort]
         total = self.one("SELECT COUNT(*) n FROM tasks" + where, args)["n"]
         rows = self.all("SELECT * FROM tasks" + where + " ORDER BY " + order + " LIMIT ? OFFSET ?", (*args, limit, offset))
-        summary = self.one(f"SELECT COALESCE(SUM(type='user' AND status NOT IN ('done','cancelled')),0) active,COALESCE(SUM(type='user' AND status='done'),0) done,COALESCE(SUM(type!='user' AND status NOT IN ('done','cancelled')),0) background,COALESCE(SUM(type='user' AND status NOT IN ('done','cancelled') AND {deadline}<julianday(?)),0) overdue,COALESCE(SUM(type='user' AND status NOT IN ('done','cancelled') AND {deadline}>=julianday(?) AND {deadline}<julianday(?)),0) today FROM tasks", (datetime.now(timezone.utc).isoformat(), day_start.isoformat(), day_end.isoformat()))
+        summary = self.one(f"SELECT COALESCE(SUM(type='user' AND status NOT IN ('done','cancelled')),0) active,COALESCE(SUM(type='user' AND status='done'),0) done,COALESCE(SUM(type!='user' AND status NOT IN ('done','cancelled')),0) background,COALESCE(SUM(type='user' AND status NOT IN ('done','cancelled') AND {deadline}<julianday(?)),0) overdue,COALESCE(SUM(type='user' AND status NOT IN ('done','cancelled') AND {deadline}>=julianday(?) AND {deadline}<julianday(?)),0) today FROM tasks WHERE COALESCE(json_extract(payload,'$.handler'),'')!='chat'", (datetime.now(timezone.utc).isoformat(), day_start.isoformat(), day_end.isoformat()))
         return {"items": [self.decode_task(row) for row in rows], "total": total, "offset": offset, "limit": limit,
                 "next_offset": offset + limit if offset + limit < total else None, "summary": summary}
 

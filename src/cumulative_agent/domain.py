@@ -32,13 +32,14 @@ class TaskCreate(BaseModel):
     timeout_seconds: int = Field(default=120, ge=1, le=3600)
     max_attempts: int = Field(default=3, ge=1, le=10)
     complexity: Literal["simple", "normal", "complex"] = "normal"
-    handler: Literal["llm", "coding", "project_tests", "resource_sync", "system_report", "usage_review", "file_index", "todo_scan"] = "llm"
+    handler: Literal["llm", "chat", "coding", "project_tests", "resource_sync", "system_report", "usage_review", "file_index", "todo_scan"] = "llm"
     code_paths: list[str] = Field(default_factory=list, max_length=20)
     start_after: datetime | None = None
     recurrence: Literal["daily", "weekly", "monthly"] | None = None
     task_timezone: str = "UTC"
     notify_before_minutes: int = Field(default=15, ge=0, le=10080)
     telegram_owner_id: int | None = Field(default=None, gt=0)
+    telegram_thread_id: int | None = Field(default=None, gt=0)
     recurring_origin: str | None = None
     recurrence_anchor_day: int | None = Field(default=None, ge=1, le=31)
     idempotency_key: str | None = Field(default=None, max_length=200)

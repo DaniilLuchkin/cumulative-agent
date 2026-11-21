@@ -2,6 +2,9 @@ database: data/agent.sqlite3
 project_roots: [] # explicit absolute allowlisted roots for project registration
 telegram_webapp_url: "" # public HTTPS URL ending in /app, or TELEGRAM_WEBAPP_URL env
 telegram_claim_first_user: false # installer enables single first-private-message claim
+telegram_mode: chat # chat: streamed LLM replies (needs an enabled model); tasks: text becomes a task
+chat_history_bytes: 24000 # conversation context sent per turn
+chat_max_tokens: 4096
 timezone: UTC # can be changed per Telegram owner with /timezone Europe/Moscow
 resource_auto_sync: true # read-only metadata task, only when OpenRouter key exists
 resource_sync_seconds: 3600

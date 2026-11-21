@@ -33,4 +33,4 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn("X-Frame-Options", config)
 
     def test_install_scripts_parse_as_bash(self):
-        subprocess.run(["bash", "-n", str(ROOT / "deploy/install-ubuntu.sh"), str(ROOT / "deploy/enable-ip-https.sh")], check=True)
+        subprocess.run(["bash", "-n", str(ROOT / "deploy/install-ubuntu.sh"), str(ROOT / "deploy/enable-ip-https.sh"), str(ROOT / "deploy/update-branch.sh")], check=True)

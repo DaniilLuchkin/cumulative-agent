@@ -1,6 +1,8 @@
 import asyncio
 import re
 import json
+import time
+from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -15,8 +17,48 @@ from .resources import ResourceManager
 from .tasks import ProjectRegistry, TaskManager
 
 
+RICH_LIMIT = 32000  # sendRichMessage accepts up to 32768 characters.
+TEXT_LIMIT = 4000   # sendMessage/sendMessageDraft accept up to 4096 characters.
+DRAFT_INTERVAL = 0.8  # seconds between streamed draft updates
+DRAFT_KEEPALIVE = 20  # drafts are 30-second previews; refresh before they expire
+BLOCKED_GRACE = 4     # a chat turn waiting for resources is reported, not queued forever
+FINISHED = ("done", "failed", "cancelled")
+COMMANDS = [
+    ("new", "Новый диалог (отдельный топик)"),
+    ("reset", "Очистить контекст текущего диалога"),
+    ("task", "Создать задачу: /task текст"),
+    ("app", "Открыть список задач"),
+    ("tasks", "Последние задачи"),
+    ("status", "Очередь и расходы"),
+    ("resources", "Модели и квоты"),
+    ("pause", "Остановить новые запуски"),
+    ("resume", "Возобновить запуски"),
+    ("help", "Справка"),
+]
+TASK_HINT = re.compile(r"^\s*(напомни|напоминание|remind|задача\s*:)", re.IGNORECASE)
+
+
+@dataclass
+class Generation:
+    owner: int
+    thread: int | None
+    task_id: str
+    draft_id: int
+    reply_to: int | None
+    text: str = ""
+    stopped: bool = False
+    drafts: bool = True
+    rich: bool = True  # Rich Markdown can reject unusual model output; fall back per answer.
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class Telegram:
-    """Private owner chats only. No model-generated tool or command execution."""
+    """Private owner chats only. No model-generated tool or command execution.
+
+    Chat mode follows the Bot API guidance for AI bots: streamed drafts
+    (sendMessageDraft / sendRichMessageDraft) with a Stop button, one context per
+    private-chat topic, and the final answer persisted with sendRichMessage.
+    """
 
     def __init__(self, repo: Repository, settings: Settings, tasks: TaskManager, resources: ResourceManager, projects: ProjectRegistry, client: httpx.AsyncClient):
         self.repo, self.settings, self.tasks, self.resources, self.projects, self.client = repo, settings, tasks, resources, projects, client
@@ -24,6 +66,13 @@ class Telegram:
         self._timer = None
         self._poll_task = None
         self.reminders = None
+        self.chat = None
+        self.worker = None
+        self.topics_enabled = False
+        self.rich_supported = True
+        self._configured = False
+        self.generations: dict[int, Generation] = {}
+        self._streams: set[asyncio.Task] = set()
 
     def start(self):
         if self.settings.telegram_bot_token and (telegram_owner_ids(self.repo, self.settings) or self.settings.telegram_claim_first_user):
@@ -48,18 +97,49 @@ class Telegram:
         except (httpx.HTTPError, ValueError, KeyError):
             raise RuntimeError("Telegram transport/protocol failure") from None
 
-    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None):
+    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None, thread_id: int | None = None):
         if chat_id not in telegram_owner_ids(self.repo, self.settings):
             raise ValueError("Unauthorized recipient")
         payload = {"chat_id": chat_id, "text": text[:4000]}
+        if thread_id:
+            payload["message_thread_id"] = thread_id
         if reply_markup:
             payload["reply_markup"] = reply_markup
         await self.call("sendMessage", payload)
 
+    async def _reply(self, owner: int, thread: int | None, text: str, markup: dict | None = None):
+        if thread:
+            await self.send(owner, text, markup, thread)
+        elif markup:
+            await self.send(owner, text, markup)
+        else:
+            await self.send(owner, text)
+
+    async def configure(self):
+        """Advertise commands and detect private-chat topics once per start."""
+        self._configured = True
+        try:
+            me = await self.call("getMe", {})
+            self.topics_enabled = bool(me.get("has_topics_enabled"))
+        except RuntimeError:
+            self.repo.event("telegram_getme_failed")
+        try:
+            await self.call("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in COMMANDS],
+                                              "scope": {"type": "all_private_chats"}})
+        except RuntimeError:
+            self.repo.event("telegram_commands_setup_failed")
+
+    def chat_available(self) -> bool:
+        if self.settings.telegram_mode != "chat" or not self.chat or not self.worker:
+            return False
+        return any(m.enabled and m.provider in self.worker.providers for m in self.repo.models())
+
     async def poll(self):
         delay = 1
         try:
-            updates = await self.call("getUpdates", {"offset": self.repo.get_setting("telegram_offset", 0), "timeout": 25, "allowed_updates": ["message", "callback_query"], "limit": 100})
+            if not self._configured:
+                await self.configure()
+            updates = await self.call("getUpdates", {"offset": self.repo.get_setting("telegram_offset", 0), "timeout": 25, "allowed_updates": ["message", "callback_query", "stopped_message_generation"], "limit": 100})
             for update in updates:
                 await self.handle(update)
                 self.repo.set_setting("telegram_offset", int(update["update_id"]) + 1)
@@ -78,6 +158,8 @@ class Telegram:
     async def handle(self, update: dict) -> bool:
         if update.get("callback_query"):
             return await self.handle_confirmation(update['callback_query'])
+        if update.get("stopped_message_generation"):
+            return self.handle_stop(update["stopped_message_generation"])
         message = update.get("message", {})
         chat, sender = message.get("chat", {}), message.get("from", {})
         owner = sender.get("id")
@@ -92,6 +174,8 @@ class Telegram:
         claimed = claim_telegram_owner(self.repo, self.settings, owner)
         if owner not in telegram_owner_ids(self.repo, self.settings):
             return False
+        thread = message.get("message_thread_id") if message.get("is_topic_message") else None
+        thread = thread if type(thread) is int and thread > 0 else None
         command = text.split()[0].split("@")[0].lower()
         natural = {"покажи задачи":"/tasks", "список задач":"/tasks", "поставь агента на паузу":"/pause", "возобнови работу":"/resume", "покажи ресурсы":"/resources"}
         command = natural.get(text.lower(),command)
@@ -117,8 +201,33 @@ class Telegram:
                 try:
                     task=self.tasks.control(matches[0]['id'],command[1:]);reply=f'Задача {task.id}: {task.status}'
                 except ValueError as error: reply=str(error)
+        elif command == "/new":
+            parts = text.split(maxsplit=1)
+            name = parts[1].strip()[:128] if len(parts) > 1 else ""
+            if self.topics_enabled:
+                try:
+                    topic = await self.call("createForumTopic", {"chat_id": owner, "name": name or "Новый чат"})
+                    thread = int(topic["message_thread_id"])
+                    if not name:
+                        self.repo.set_setting(f"chat_autoname:{owner}:{thread}", True)
+                    reply = "Новый диалог. Контекст пустой — задайте вопрос."
+                except (RuntimeError, KeyError, TypeError, ValueError):
+                    self.chat and self.chat.reset(owner, thread)
+                    reply = "Не удалось создать топик; контекст этого диалога очищен."
+            else:
+                self.chat and self.chat.reset(owner, thread)
+                reply = "Контекст очищен. Чтобы вести диалоги в отдельных топиках, включите для бота режим топиков в @BotFather."
+        elif command == "/reset":
+            self.chat and self.chat.reset(owner, thread)
+            reply = "Контекст этого диалога очищен."
+        elif command == "/task":
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                reply = "Напишите задачу после команды: /task Напомни завтра в 18:00 позвонить"
+            else:
+                reply, markup = self.intake(owner, parts[1].strip(), update["update_id"])
         elif command == "/tasks":
-            items = self.repo.tasks(limit=20)
+            items = [t for t in self.repo.tasks(limit=100) if t.handler != "chat"][:20]
             reply = "\n".join(f"{t.id[:8]} [{t.status}] p={t.priority} {t.title}" for t in items) or "Очередь пуста."
         elif command == "/status":
             m = Metrics(self.repo).snapshot()
@@ -146,31 +255,211 @@ class Telegram:
             else:
                 reply = "Mini App готово, но публичный HTTPS-адрес ещё не настроен. Укажите TELEGRAM_WEBAPP_URL для сервиса."
         elif command in ("/start", "/help"):
-            reply = "Напишите задачу обычным языком: «Напомни завтра в 18:00, высокий приоритет». /app — список с дедлайнами и приоритетами. /tasks /status /resources /projects /background [on|off] /pause /resume /cancel ID /retry ID /timezone Europe/Moscow."
+            if self.chat_available():
+                reply = ("Пишите как в обычном чате — ответ появляется по мере генерации, его можно остановить кнопкой «Стоп». "
+                         "/new — новый диалог" + (" в отдельном топике" if self.topics_enabled else "") + ", /reset — очистить контекст.\n"
+                         "Задачи: /task текст или сообщение, начинающееся с «Напомни…». /app — список задач. "
+                         "/tasks /status /resources /projects /background [on|off] /pause /resume /cancel ID /retry ID /timezone Europe/Moscow.")
+            else:
+                reply = "Напишите задачу обычным языком: «Напомни завтра в 18:00, высокий приоритет». /app — список с дедлайнами и приоритетами. /tasks /status /resources /projects /background [on|off] /pause /resume /cancel ID /retry ID /timezone Europe/Moscow."
             if self.settings.telegram_webapp_url:
                 markup = {"inline_keyboard": [[{"text": "Открыть мои задачи", "web_app": {"url": self.settings.telegram_webapp_url}}]]}
         elif command.startswith("/"):
             reply = "Неизвестная команда. /help"
+        elif self.chat_available() and not TASK_HINT.match(text):
+            if claimed:
+                await self._safe_reply(owner, thread, f"Вы назначены владельцем бота. Ваш Telegram ID: {owner}. Привязка сохранена; другим пользователям доступ закрыт.", update)
+            await self.start_generation(owner, thread, text, update["update_id"], message.get("message_id"))
+            return True
         else:
-            zone=self.repo.get_setting('timezone:'+str(owner),self.settings.timezone)
-            spec,confirm,warning=parse_task(text,self.projects.list(),zone,owner,update['update_id'])
-            if confirm:
-                draft_id=str(update['update_id'])
-                self.repo.set_setting('intake:'+draft_id,{'owner':owner,'spec':spec.model_dump(mode='json')})
-                reply='Проверьте параметры перед созданием:\n'+describe(spec)+(('\n'+warning) if warning else '')+'\nДля исправления напишите задачу заново.'
-                markup={'inline_keyboard':[[{'text':'Создать с этими параметрами','callback_data':f'intake:{draft_id}:confirm'}, {'text':'Только напоминание','callback_data':f'intake:{draft_id}:reminder'}]]}
-            else:
-                task=self.tasks.create(spec);reply=f'Задача {task.id} добавлена.\n'+describe(spec)
+            reply, markup = self.intake(owner, text, update["update_id"])
         # Task creation remains durable even if acknowledgement fails.
         if claimed:
             reply = f"Вы назначены владельцем бота. Ваш Telegram ID: {owner}. Привязка сохранена; другим пользователям доступ закрыт.\n\n" + reply
+        await self._safe_reply(owner, thread, reply, update, markup)
+        return True
+
+    async def _safe_reply(self, owner, thread, reply, update, markup=None):
         try:
-            if markup:
-                await self.send(owner, reply, markup)
-            else:
-                await self.send(owner, reply)
+            await self._reply(owner, thread, reply, markup)
         except RuntimeError:
             self.repo.event("telegram_reply_failed", update_id=update["update_id"])
+
+    def intake(self, owner: int, text: str, update_id: int):
+        zone=self.repo.get_setting('timezone:'+str(owner),self.settings.timezone)
+        spec,confirm,warning=parse_task(text,self.projects.list(),zone,owner,update_id)
+        if confirm:
+            draft_id=str(update_id)
+            self.repo.set_setting('intake:'+draft_id,{'owner':owner,'spec':spec.model_dump(mode='json')})
+            reply='Проверьте параметры перед созданием:\n'+describe(spec)+(('\n'+warning) if warning else '')+'\nДля исправления напишите задачу заново.'
+            markup={'inline_keyboard':[[{'text':'Создать с этими параметрами','callback_data':f'intake:{draft_id}:confirm'}, {'text':'Только напоминание','callback_data':f'intake:{draft_id}:reminder'}]]}
+            return reply, markup
+        task=self.tasks.create(spec)
+        return f'Задача {task.id} добавлена.\n'+describe(spec), None
+
+    # --- Chat mode -----------------------------------------------------------------
+
+    async def start_generation(self, owner: int, thread: int | None, text: str, update_id: int, message_id: int | None):
+        key = f"telegram:{owner}:{update_id}"
+        if self.repo.one("SELECT id FROM tasks WHERE idempotency_key=?", (key,)):
+            return  # Redelivered update: the turn already exists.
+        zone = self.repo.get_setting('timezone:' + str(owner), self.settings.timezone)
+        spec = TaskCreate(title=text[:200], description=text[:40000], priority=100, handler="chat", telegram_owner_id=owner,
+                          telegram_thread_id=thread, idempotency_key=key, max_attempts=1, max_tokens=self.settings.chat_max_tokens,
+                          timeout_seconds=self.settings.limits.timeout_seconds, task_timezone=zone)
+        task = self.tasks.create(spec)
+        # Both run before the worker tick that tasks.create scheduled on this loop.
+        self.chat.add(owner, thread, "user", text, task.id)
+        generation = Generation(owner, thread, task.id, update_id, message_id if type(message_id) is int else None)
+        self.generations[generation.draft_id] = generation
+
+        def sink(accumulated: str):
+            generation.text = accumulated
+            generation.changed.set()
+        self.worker.stream_sinks[task.id] = sink
+        stream = asyncio.create_task(self.stream(generation))
+        self._streams.add(stream)
+        stream.add_done_callback(self._streams.discard)
+
+    async def draft(self, generation: Generation, text: str):
+        if not generation.drafts:
+            try:
+                await self.call("sendChatAction", {"chat_id": generation.owner, "action": "typing", **({"message_thread_id": generation.thread} if generation.thread else {})})
+            except RuntimeError:
+                pass
+            return
+        base = {"chat_id": generation.owner, "draft_id": generation.draft_id, "can_stop": True}
+        if generation.thread:
+            base["message_thread_id"] = generation.thread
+        if text and self.rich_supported and generation.rich:
+            try:
+                await self.call("sendRichMessageDraft", {**base, "rich_message": {"markdown": text[:RICH_LIMIT]}})
+                return
+            except RuntimeError:
+                generation.rich = False
+                self.repo.event("telegram_rich_draft_failed")
+        try:
+            visible = text if len(text) <= TEXT_LIMIT else "…" + text[-(TEXT_LIMIT - 1):]
+            await self.call("sendMessageDraft", {**base, "text": visible})
+        except RuntimeError:
+            generation.drafts = False
+            self.repo.event("telegram_draft_failed")
+
+    async def stream(self, generation: Generation):
+        """Mirror a chat task into drafts, then persist the final answer."""
+        started = time.monotonic()
+        limit = self.settings.limits.timeout_seconds + 60
+        shown, last_sent, blocked_since = None, 0.0, None
+        try:
+            await self.draft(generation, "")
+            last_sent = time.monotonic()
+            while True:
+                try:
+                    await asyncio.wait_for(generation.changed.wait(), timeout=DRAFT_INTERVAL)
+                except TimeoutError:
+                    pass
+                generation.changed.clear()
+                task = self.repo.task(generation.task_id)
+                if not task or task.status in FINISHED:
+                    break
+                current = time.monotonic()
+                if task.status == "blocked" and (task.blocked_reason or "").startswith("wait:"):
+                    blocked_since = blocked_since or current
+                    if current - blocked_since >= BLOCKED_GRACE:
+                        try:
+                            self.tasks.control(task.id, "cancel", "chat_blocked")
+                        except (KeyError, ValueError):
+                            pass
+                        generation.text = ""
+                        reason = task.blocked_reason.removeprefix("wait:")
+                        await self.finish_generation(generation, f"Сейчас не могу ответить: {reason}. Проверьте /resources и лимиты бюджета.", store=False)
+                        return
+                else:
+                    blocked_since = None
+                if current - started > limit:
+                    break
+                if generation.text != shown and current - last_sent >= DRAFT_INTERVAL:
+                    shown = generation.text
+                    await self.draft(generation, shown)
+                    last_sent = current
+                elif current - last_sent >= DRAFT_KEEPALIVE:
+                    await self.draft(generation, generation.text)
+                    last_sent = current
+            await self.deliver(generation)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.repo.event("telegram_stream_failed", generation.task_id, error_type=type(exc).__name__)
+        finally:
+            self.worker.stream_sinks.pop(generation.task_id, None)
+            self.generations.pop(generation.draft_id, None)
+
+    async def deliver(self, generation: Generation):
+        task = self.repo.task(generation.task_id)
+        run = self.repo.one("SELECT status,result,error FROM task_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1", (generation.task_id,))
+        if task and task.status == "done" and run and run["result"]:
+            await self.finish_generation(generation, run["result"])
+        elif generation.stopped or (task and task.status == "cancelled"):
+            partial = generation.text.strip()
+            if partial:
+                await self.finish_generation(generation, partial + "\n\n_Генерация остановлена._", stored_text=partial)
+            else:
+                await self.finish_generation(generation, "Генерация остановлена.", store=False)
+        else:
+            error = (run["error"] if run else None) or "ответ не получен"
+            await self.finish_generation(generation, f"Не удалось получить ответ: {error}", store=False)
+
+    async def finish_generation(self, generation: Generation, text: str, store: bool = True, stored_text: str | None = None):
+        if store:
+            self.chat.add(generation.owner, generation.thread, "assistant", stored_text or text, generation.task_id)
+        self.repo.set_setting("telegram_notified:" + generation.task_id, True)
+        try:
+            await self.send_markdown(generation.owner, generation.thread, text, generation.reply_to)
+        except RuntimeError:
+            self.repo.event("telegram_reply_failed", generation.task_id)
+        await self.autoname(generation)
+
+    async def autoname(self, generation: Generation):
+        key = f"chat_autoname:{generation.owner}:{generation.thread}"
+        if not generation.thread or not self.repo.get_setting(key, False):
+            return
+        self.repo.set_setting(key, False)
+        first = self.repo.one("SELECT content FROM chat_messages WHERE owner_id=? AND thread_id=? AND role='user' ORDER BY id LIMIT 1", (generation.owner, generation.thread))
+        if first:
+            name = " ".join(first["content"].split())[:60] or "Чат"
+            try:
+                await self.call("editForumTopic", {"chat_id": generation.owner, "message_thread_id": generation.thread, "name": name})
+            except RuntimeError:
+                pass
+
+    async def send_markdown(self, owner: int, thread: int | None, text: str, reply_to: int | None = None):
+        """Final answer: rich Markdown when supported, plain 4096-character chunks otherwise."""
+        if owner not in telegram_owner_ids(self.repo, self.settings):
+            raise ValueError("Unauthorized recipient")
+        base = {"chat_id": owner}
+        if thread:
+            base["message_thread_id"] = thread
+        reply = {"reply_parameters": {"message_id": reply_to, "allow_sending_without_reply": True}} if reply_to else {}
+        if self.rich_supported and len(text) <= RICH_LIMIT:
+            try:
+                await self.call("sendRichMessage", {**base, **reply, "rich_message": {"markdown": text}})
+                return
+            except RuntimeError:
+                self.repo.event("telegram_rich_message_failed")
+        for index, start in enumerate(range(0, len(text), TEXT_LIMIT)):
+            await self.call("sendMessage", {**base, **(reply if index == 0 else {}), "text": text[start:start + TEXT_LIMIT]})
+
+    def handle_stop(self, stopped: dict) -> bool:
+        owner = stopped.get("chat", {}).get("id")
+        generation = self.generations.get(stopped.get("draft_id"))
+        if not generation or owner != generation.owner or owner not in telegram_owner_ids(self.repo, self.settings):
+            return False
+        generation.stopped = True
+        try:
+            self.tasks.control(generation.task_id, "cancel", "user_stopped_generation")
+        except (KeyError, ValueError):
+            pass
+        generation.changed.set()
         return True
 
     async def handle_confirmation(self, query):
@@ -198,13 +487,29 @@ class Telegram:
                 continue
             run = self.repo.one("SELECT result,error FROM task_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1", (row["id"],))
             task = self.repo.task(row["id"])
+            if task.handler == "chat":
+                if task.id in self.worker_sinks():
+                    continue  # Streaming in progress; the stream delivers it.
+                # Recovered after a restart: deliver the stored answer without drafts.
+                generation = Generation(owner, task.telegram_thread_id, task.id, 1, None)
+                if task.status == "done" and run and run["result"]:
+                    await self.finish_generation(generation, run["result"])
+                else:
+                    self.repo.set_setting("telegram_notified:" + task.id, True)
+                continue
             content = "Отмечена выполненной владельцем." if task.completed_manually else ((run["result"] or run["error"] or "") if run else "")
             text = f"Задача {row['id']} [{row['status']}]\n" + content
             await self.send(owner, text)
             self.repo.set_setting("telegram_notified:" + row["id"], True)
 
+    def worker_sinks(self) -> dict:
+        return self.worker.stream_sinks if self.worker else {}
+
     async def stop(self):
         self.enabled = False
+        for stream in list(self._streams):
+            stream.cancel()
+        await asyncio.gather(*self._streams, return_exceptions=True)
         if self._timer:
             self._timer.cancel()
         if self._poll_task and not self._poll_task.done():

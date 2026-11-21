@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 
 import yaml
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from urllib.parse import urlsplit
 
@@ -55,6 +57,9 @@ class Settings(BaseModel):
     telegram_webapp_url: str = ""
     telegram_init_data_max_age_seconds: int = Field(default=3600, ge=60, le=86400)
     timezone: str = "UTC"
+    telegram_mode: Literal["chat", "tasks"] = "chat"
+    chat_history_bytes: int = Field(default=24000, ge=0, le=400000)
+    chat_max_tokens: int = Field(default=4096, ge=128, le=200000)
     resource_sync_seconds: int = Field(default=3600, ge=60, le=86400)
     resource_auto_sync: bool = False
 
@@ -95,6 +100,8 @@ def load_settings(path: str | None = None) -> Settings:
         data["telegram_claim_first_user"] = value in ("true", "1")
     if "AGENT_DATABASE" in os.environ:
         data["database"] = os.environ["AGENT_DATABASE"]
+    if "TELEGRAM_MODE" in os.environ:
+        data["telegram_mode"] = os.environ["TELEGRAM_MODE"].strip().lower()
     if "TELEGRAM_WEBAPP_URL" in os.environ:
         data["telegram_webapp_url"] = os.environ["TELEGRAM_WEBAPP_URL"]
     return Settings.model_validate(data)

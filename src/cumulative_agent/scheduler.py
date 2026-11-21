@@ -21,6 +21,7 @@ class Scheduler:
     def __init__(self, repo: Repository, resources: ResourceManager, router: Router, memory: Memory, projects: ProjectRegistry):
         self.repo, self.resources, self.router, self.memory, self.projects = repo, resources, router, memory, projects
         self.coding = None
+        self.chat = None
 
     def score(self, task: Task, decision: Decision | None) -> float:
         current = datetime.now(timezone.utc)
@@ -61,6 +62,9 @@ class Scheduler:
                     else:
                         prompt, prepared = self.coding.prepare(task)
                         decision = self.router.choose(task, prompt)
+                elif task.handler == "chat":
+                    prompt = self.chat.prompt(task)
+                    decision = self.router.choose(task, prompt)
                 elif task.handler == "llm":
                     prompt = build_prompt(task, self.memory, self.projects)
                     decision = self.router.choose(task, prompt)

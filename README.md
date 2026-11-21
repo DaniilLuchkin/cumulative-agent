@@ -48,6 +48,15 @@ HTTPS IP требует Certbot ≥5.4 и short-lived certificate; настро�
 tar -xzf cumulative-agent-improved.tar.gz && sudo bash cumulative-agent/deploy/install-ubuntu.sh
 ```
 
+## Чат-режим (ветка Alt)
+
+Обычный текст боту — диалог с LLM: стриминг ответа черновиками, кнопка «Стоп»,
+отдельный контекст в каждом топике (`/new`), итоговый ответ в Rich Markdown.
+Задачи создаются через `/task …` или сообщения «Напомни…». Нужна включённая модель
+и ненулевой `daily_cost_limit`. Подробности и разбор документации Telegram —
+[TELEGRAM_CHAT.md](docs/TELEGRAM_CHAT.md); обновление сервера —
+[OPERATIONS.md](docs/OPERATIONS.md#переключение-на-ветку).
+
 ## Быстрый локальный запуск
 
 ```bash

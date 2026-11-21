@@ -182,6 +182,20 @@ Git и bubblewrap включены в image. Docker seccomp/user namespaces мо
 `SSL_CERT_FILE` (HTTPX); TLS verification никогда не отключать. На обычном Ubuntu
 такой mount не нужен.
 
+## Переключение на ветку
+
+Обновить существующую установку до ветки или тега GitHub (по умолчанию `Alt`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/deploy/update-branch.sh | sudo bash -s -- Alt
+```
+
+Скрипт останавливает сервис, делает backup БД в `/var/lib/cumulative-agent/agent.sqlite3.before-<commit>-<время>`,
+заменяет код в `/opt/cumulative-agent` (кроме `.venv`), переустанавливает пакет и
+запускает сервис. `/etc/cumulative-agent.env` и YAML не меняются. Возврат на `main`
+тем же скриптом (`... | sudo bash -s -- main`) требует восстановления backup: старый
+код не читает задачи с `handler=chat`.
+
 ## Backup and restore
 
 Обновление существующей установки выполняется отдельно от fresh installer.

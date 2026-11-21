@@ -1,6 +1,7 @@
 import httpx
 
 from .agents import LocalAgents
+from .chat import ChatStore
 from .config import Settings
 from .coding import CodingWorkflow
 from .metrics import Metrics
@@ -31,6 +32,8 @@ class Service:
         self.scheduler = Scheduler(self.repo, self.resources, self.router, self.memory, self.projects)
         self.coding = CodingWorkflow(self.repo, settings, self.projects, self.tasks)
         self.scheduler.coding = self.coding
+        self.chat = ChatStore(self.repo, settings.chat_history_bytes)
+        self.scheduler.chat = self.chat
         self.planner = Planner(self.repo, settings, self.tasks, self.projects)
         self.agents = LocalAgents(self.repo, settings, self.projects)
         self.observer = ResourceObserver(self.repo, settings, self.client)
@@ -46,6 +49,7 @@ class Service:
         self.worker.observer = self.observer
         self.telegram = Telegram(self.repo, settings, self.tasks, self.resources, self.projects, self.client)
         self.telegram.reminders = self.reminders
+        self.telegram.chat, self.telegram.worker = self.chat, self.worker
         self.metrics = Metrics(self.repo)
 
     async def start(self):

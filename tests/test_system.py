@@ -307,6 +307,7 @@ class DomainTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_telegram_acl_and_idempotent_conversational_task(self):
         self.s.settings.telegram_owner_ids = [123]
+        self.s.settings.telegram_mode = "tasks"
         sent = []
         async def send(chat, text):
             sent.append((chat, text))

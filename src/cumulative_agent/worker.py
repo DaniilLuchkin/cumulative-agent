@@ -31,6 +31,8 @@ class Worker:
         self.coding = None
         self.reminders = None
         self.observer = None
+        # task_id -> callback(accumulated_text); registered by interactive front-ends.
+        self.stream_sinks: dict = {}
 
     def should_yield(self,task):
         if task.type=='user':return False
@@ -238,7 +240,11 @@ class Worker:
                     model = next(m for m in self.repo.models() if m.id == selection.decision.model)
                     self.repo.execute("UPDATE task_runs SET remote_started=1 WHERE id=?", (run_id,))
                     self.coding.stage(run_id, "model", "running", model=model.id)
-                    completion = await self.providers[model.provider].complete(model, selection.prompt, selection.decision.output_limit, timeout)
+                    if selection.task.handler == "chat":
+                        completion = await self.providers[model.provider].complete(model, selection.prompt, selection.decision.output_limit, timeout,
+                                                                                    messages=json.loads(selection.prompt), on_delta=self.stream_sinks.get(selection.task.id))
+                    else:
+                        completion = await self.providers[model.provider].complete(model, selection.prompt, selection.decision.output_limit, timeout)
                     result = completion.text[:100000]
                     if completion.input_tokens + completion.output_tokens > selection.decision.input_bound + selection.decision.output_limit or completion.output_tokens > selection.decision.output_limit:
                         error = "Provider exceeded requested token bound"
