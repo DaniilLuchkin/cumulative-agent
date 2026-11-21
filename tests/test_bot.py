@@ -32,12 +32,16 @@ class FakeLLM:
     def __init__(self, chunks=("Привет", ", **мир**", "!"), pause=0.02, error=None):
         self.chunks, self.pause, self.error, self.requests = chunks, pause, error, []
 
-    async def complete(self, messages, max_tokens=64):
+    async def prices(self):
+        return {"deepseek/deepseek-v4.1-flash": (0.05, 0.2)}
+
+    async def complete(self, messages, model=None, max_tokens=64):
         self.titles = getattr(self, "titles", []) + [messages]
         return "«Поездка в Казань.»"
 
-    async def stream(self, messages):
+    async def stream(self, messages, model=None):
         self.requests.append(messages)
+        self.models = getattr(self, "models", []) + [model]
         if self.error:
             raise LLMError(self.error)
         text = ""
@@ -64,7 +68,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_and_topics_detected(self):
         self.assertTrue(self.bot.topics_enabled)
         commands = self.api.sent("setMyCommands")[0]
-        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "reset", "help"])
+        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "reset", "settings", "help"])
         self.assertEqual(commands["scope"], {"type": "all_private_chats"})
 
     async def test_streams_thinking_then_drafts_then_rich_answer(self):
@@ -121,7 +125,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(r["message_thread_id"], r["name"]) for r in renames], [(88, "Поездка в Казань")])
 
     async def test_title_failure_falls_back_to_first_message(self):
-        async def broken(messages, max_tokens=64):
+        async def broken(messages, model=None, max_tokens=64):
             raise LLMError("down")
         self.llm.complete = broken
         first = message("Вопрос про налоги", 40, thread=90)
@@ -179,6 +183,31 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         photo = message("")
         await self.bot.on_message(photo)
         self.assertIn("текстовые", self.api.sent("sendMessage")[-1]["text"])
+
+    async def test_settings_switches_model_in_place(self):
+        await self.bot.on_message(message("/settings"))
+        sent = self.api.sent("sendMessage")[-1]
+        self.assertIn("Модель: openrouter/auto", sent["text"])
+        buttons = [row[0] for row in sent["reply_markup"]["inline_keyboard"]]
+        self.assertTrue(buttons[0]["text"].startswith("✓ auto"))
+        flash = next(i for i, m in enumerate(self.bot.models) if m == "deepseek/deepseek-v4.1-flash")
+        self.assertIn("$0.05/$0.20", buttons[flash]["text"])
+        query = {"id": "q1", "from": {"id": 123}, "data": f"model:{flash}", "message": {"message_id": 5, "chat": {"id": 123}}}
+        await self.bot.on_callback(query)
+        self.assertEqual(self.api.sent("answerCallbackQuery")[-1]["text"], "Модель: deepseek-v4.1-flash")
+        edited = self.api.sent("editMessageText")[-1]
+        self.assertEqual(edited["message_id"], 5)
+        self.assertTrue(edited["reply_markup"]["inline_keyboard"][flash][0]["text"].startswith("✓ "))
+        await self.bot.on_message(message("Привет", 11))
+        self.assertEqual(self.llm.models[-1], "deepseek/deepseek-v4.1-flash")
+
+    async def test_settings_rejects_strangers_and_stale_buttons(self):
+        await self.bot.on_message(message("Привет"))  # 123 becomes owner
+        await self.bot.on_callback({"id": "q", "from": {"id": 999}, "data": "model:1", "message": {"message_id": 5, "chat": {"id": 999}}})
+        self.assertIsNone(self.bot.store.get("model:999"))
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "model:99", "message": {"message_id": 5, "chat": {"id": 123}}})
+        self.assertIn("изменился", self.api.sent("answerCallbackQuery")[-1]["text"])
+        self.assertEqual(self.bot.current_model(123), "openrouter/auto")
 
     def test_split_prefers_paragraphs(self):
         text = "a" * 30 + "\n\n" + "b" * 30

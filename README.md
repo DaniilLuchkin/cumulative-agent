@@ -13,7 +13,8 @@
 | Кнопка «Стоп» под черновиком | `can_stop: true` → update `stopped_message_generation` → вызов модели отменяется, частичный ответ сохраняется |
 | Итоговый ответ остаётся в чате: заголовки, таблицы, код | `sendRichMessage` (до 32768 символов), ответ на сообщение пользователя; при ошибке — `sendMessage` частями по 4000 |
 | Отдельные диалоги в топиках | Свой контекст у каждого топика. `/new` → `createForumTopic`. Топик, созданный в клиенте (`forum_topic_created.is_name_implicit`) или через `/new` без имени, после первого ответа получает название от модели (`editForumTopic`) |
-| Подсказки команд | `setMyCommands`: `/new`, `/reset`, `/help` |
+| Выбор модели | Глобальная команда `/settings`: inline-клавиатура с моделями и ценами из каталога OpenRouter; при нажатии сообщение редактируется на месте (`editMessageText`) |
+| Подсказки команд | `setMyCommands`: `/new`, `/reset`, `/settings`, `/help` |
 
 Бот работает только в личном чате. Доступ есть у пользователей из `ALLOWED_USER_IDS`,
 а если список пуст — у первого, кто напишет боту. История хранится в SQLite; в модель
@@ -43,6 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 | `TELEGRAM_BOT_TOKEN` | — | обязательна |
 | `OPENROUTER_API_KEY` | — | обязательна |
 | `LLM_MODEL` | модель из старого `cumulative-agent.yaml`, иначе `openrouter/auto` | любой id с openrouter.ai/models; фактическая модель пишется в лог |
+| `LLM_MODELS` | DeepSeek V4.1 Flash, DeepSeek V4 Pro, Gemini 4 Hydrogen, GPT-6.2 Sol, Claude Fable 5.2 | список для `/settings` через запятую; `LLM_MODEL` добавляется всегда |
 | `ALLOWED_USER_IDS` | пусто | ID через запятую |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
 | `MAX_OUTPUT_TOKENS` | 4096 | |

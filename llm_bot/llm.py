@@ -17,9 +17,20 @@ class OpenRouter:
         self.max_tokens, self.timeout = max_tokens, timeout
         self.last_model = None  # model that actually served the last answer (differs for openrouter/auto)
 
-    async def complete(self, messages: list[dict], max_tokens: int = 64) -> str:
+    async def prices(self) -> dict[str, tuple[float, float]]:
+        """Public catalog: model id -> (prompt, completion) USD per million tokens."""
+        response = await self.client.get("https://openrouter.ai/api/v1/models", timeout=30)
+        result = {}
+        for item in response.json()["data"]:
+            try:
+                result[item["id"]] = (float(item["pricing"]["prompt"]) * 1e6, float(item["pricing"]["completion"]) * 1e6)
+            except (KeyError, TypeError, ValueError):
+                continue
+        return result
+
+    async def complete(self, messages: list[dict], model: str | None = None, max_tokens: int = 64) -> str:
         """Short non-streamed completion, e.g. a topic title."""
-        body = {"model": self.model, "messages": messages, "max_tokens": max_tokens}
+        body = {"model": model or self.model, "messages": messages, "max_tokens": max_tokens}
         try:
             response = await self.client.post(self.url, json=body, headers={"Authorization": "Bearer " + self.api_key}, timeout=60)
             text = response.json()["choices"][0]["message"]["content"]
@@ -29,9 +40,9 @@ class OpenRouter:
             raise LLMError("OpenRouter: empty title")
         return text
 
-    async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
+    async def stream(self, messages: list[dict], model: str | None = None) -> AsyncIterator[str]:
         """Yield the accumulated answer text after every received delta."""
-        body = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
+        body = {"model": model or self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
         headers = {"Authorization": "Bearer " + self.api_key, "X-Title": "Telegram LLM bot"}
         text = ""
         try:

@@ -25,7 +25,10 @@ TITLE_PROMPT = ("Name this conversation in 2-5 words in the language of the user
                 "Reply with the title only, no quotes or trailing period.")
 SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
-COMMANDS = [("new", "Новый диалог"), ("reset", "Очистить контекст"), ("help", "Справка")]
+COMMANDS = [("new", "Новый диалог"), ("reset", "Очистить контекст"), ("settings", "Выбор модели"), ("help", "Справка")]
+# Shown in /settings; override with LLM_MODELS (comma-separated OpenRouter ids).
+DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4-pro", "google/gemini-4-hydrogen",
+                  "openai/gpt-6.2-sol", "anthropic/claude-fable-5.2"]
 
 
 @dataclass
@@ -33,6 +36,7 @@ class Config:
     telegram_token: str
     openrouter_key: str
     model: str = "openrouter/auto"
+    models: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
     system_prompt: str = DEFAULT_PROMPT
     allowed_ids: set[int] = field(default_factory=set)
     database: str = "data/bot.sqlite3"
@@ -46,10 +50,11 @@ class Config:
         missing = [name for name in ("TELEGRAM_BOT_TOKEN", "OPENROUTER_API_KEY") if not os.environ.get(name)]
         if missing:
             raise SystemExit("Missing environment variables: " + ", ".join(missing))
+        models = [m for m in os.environ.get("LLM_MODELS", "").replace(" ", "").split(",") if m] or list(DEFAULT_MODELS)
         ids = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
         return cls(telegram_token=os.environ["TELEGRAM_BOT_TOKEN"], openrouter_key=os.environ["OPENROUTER_API_KEY"],
                    model=os.environ.get("LLM_MODEL") or cls.model, system_prompt=os.environ.get("SYSTEM_PROMPT") or DEFAULT_PROMPT,
-                   allowed_ids=ids, database=os.environ.get("BOT_DB", cls.database),
+                   models=models, allowed_ids=ids, database=os.environ.get("BOT_DB", cls.database),
                    max_tokens=int(os.environ.get("MAX_OUTPUT_TOKENS", cls.max_tokens)),
                    history_chars=int(os.environ.get("HISTORY_CHARS", cls.history_chars)))
 
@@ -102,6 +107,9 @@ class Bot:
         self.generations: dict[tuple[int, int], asyncio.Task] = {}
         self.stopped: set[tuple[int, int]] = set()
         self.tasks: set[asyncio.Task] = set()
+        self.prices: dict[str, tuple[float, float]] = {}
+        # The configured default is always selectable.
+        self.models = list(dict.fromkeys([config.model, *config.models]))
 
     # --- setup and polling ---------------------------------------------------------
 
@@ -114,6 +122,10 @@ class Bot:
     async def configure(self):
         me = await self.api.call("getMe")
         self.topics_enabled = bool(me.get("has_topics_enabled"))
+        try:
+            self.prices = await self.llm.prices()
+        except Exception:
+            log.warning("could not load OpenRouter prices")
         await self.api.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in COMMANDS],
                             scope={"type": "all_private_chats"})
         log.info("started as @%s, topics=%s, model=%s", me.get("username"), self.topics_enabled, self.config.model)
@@ -130,7 +142,7 @@ class Bot:
         while True:
             try:
                 updates = await self.api.call("getUpdates", http_timeout=40, offset=offset, timeout=30, limit=100,
-                                              allowed_updates=["message", "stopped_message_generation"])
+                                              allowed_updates=["message", "callback_query", "stopped_message_generation"])
             except TelegramError as exc:
                 log.warning("getUpdates failed: %s", exc.description)
                 await asyncio.sleep(exc.retry_after or 5)
@@ -150,6 +162,8 @@ class Bot:
         try:
             if "stopped_message_generation" in update:
                 self.on_stop(update["stopped_message_generation"])
+            elif "callback_query" in update:
+                await self.on_callback(update["callback_query"])
             elif "message" in update:
                 await self.on_message(update["message"])
         except Exception:
@@ -187,7 +201,10 @@ class Bot:
         if command in ("/start", "/help"):
             topics = "/new — новый диалог в отдельном топике.\n" if self.topics_enabled else "/new — начать диалог заново.\n"
             await self.reply(chat_id, thread_id, "Напишите вопрос — ответ появляется по мере генерации, его можно остановить кнопкой «Стоп».\n"
-                             + topics + "/reset — очистить контекст этого диалога.")
+                             + topics + "/reset — очистить контекст этого диалога.\n/settings — выбрать модель.")
+        elif command in ("/settings", "/model"):
+            await self.api.call("sendMessage", text=self.settings_text(chat_id), reply_markup=self.settings_keyboard(chat_id),
+                                **self._target(chat_id, thread_id, None))
         elif command == "/new":
             await self.new_topic(chat_id, thread_id, text.partition(" ")[2].strip())
         elif command == "/reset":
@@ -220,7 +237,7 @@ class Bot:
             key = (chat_id, message_id)
             draft = Draft(self, chat_id, thread_id, message_id)
             pusher = asyncio.create_task(draft.run())
-            generation = asyncio.create_task(self.generate(messages, draft))
+            generation = asyncio.create_task(self.generate(messages, draft, self.current_model(chat_id)))
             self.generations[key] = generation
             stopped, error = False, None
             try:
@@ -238,7 +255,7 @@ class Bot:
             if error:
                 await self.reply(chat_id, thread_id, "Не удалось получить ответ: " + error, message_id)
                 return
-            log.info("answered in chat %s topic %s with %s", chat_id, thread_id, getattr(self.llm, "last_model", None) or self.config.model)
+            log.info("answered in chat %s topic %s with %s", chat_id, thread_id, getattr(self.llm, "last_model", None) or self.current_model(chat_id))
             result = draft.text.strip()
             if result:
                 self.store.add(chat_id, thread_id, "assistant", result)
@@ -247,9 +264,54 @@ class Bot:
             await self.send_markdown(chat_id, thread_id, result, message_id)
             await self.autoname(chat_id, thread_id)
 
-    async def generate(self, messages: list[dict], draft: Draft):
-        async for text in self.llm.stream(messages):
+    async def generate(self, messages: list[dict], draft: Draft, model: str):
+        async for text in self.llm.stream(messages, model):
             draft.text = text
+
+    # --- model selection (/settings, inline keyboard edited in place) ---------------
+
+    def current_model(self, chat_id: int) -> str:
+        chosen = self.store.get(f"model:{chat_id}")
+        return chosen if chosen in self.models else self.config.model
+
+    def price(self, model: str) -> str:
+        if model not in self.prices:
+            return ""
+        prompt, completion = self.prices[model]
+        return f" · ${prompt:.2f}/${completion:.2f}"
+
+    def settings_text(self, chat_id: int) -> str:
+        return ("Модель: " + self.current_model(chat_id) + self.price(self.current_model(chat_id)) +
+                "\nЦена — $ за 1 млн токенов: ввод/вывод. Выбор действует во всех диалогах.")
+
+    def settings_keyboard(self, chat_id: int) -> dict:
+        current = self.current_model(chat_id)
+        rows = [[{"text": ("✓ " if model == current else "") + model.split("/")[-1] + self.price(model),
+                  "callback_data": f"model:{index}", **({"style": "primary"} if model == current else {})}]
+                for index, model in enumerate(self.models)]
+        return {"inline_keyboard": rows}
+
+    async def on_callback(self, query: dict):
+        user, message, data = query.get("from", {}), query.get("message") or {}, query.get("data", "")
+        if not self.allowed(user.get("id")) or not data.startswith("model:"):
+            await self.api.call("answerCallbackQuery", callback_query_id=query["id"])
+            return
+        try:
+            model = self.models[int(data.removeprefix("model:"))]
+        except (ValueError, IndexError):
+            await self.api.call("answerCallbackQuery", callback_query_id=query["id"], text="Список моделей изменился, откройте /settings снова")
+            return
+        chat_id = message.get("chat", {}).get("id", user["id"])
+        self.store.set(f"model:{chat_id}", model)
+        log.info("chat %s switched model to %s", chat_id, model)
+        await self.api.call("answerCallbackQuery", callback_query_id=query["id"], text="Модель: " + model.split("/")[-1])
+        if message.get("message_id"):
+            try:
+                await self.api.call("editMessageText", chat_id=chat_id, message_id=message["message_id"],
+                                    text=self.settings_text(chat_id), reply_markup=self.settings_keyboard(chat_id))
+            except TelegramError as exc:
+                if "not modified" not in exc.description:
+                    log.warning("settings edit failed: %s", exc.description)
 
     def on_stop(self, event: dict):
         key = (event.get("chat", {}).get("id"), event.get("draft_id"))
@@ -267,7 +329,8 @@ class Bot:
                 return
             name = first[:60]
             try:
-                title = await self.llm.complete([{"role": "system", "content": TITLE_PROMPT}, {"role": "user", "content": first[:2000]}], max_tokens=30)
+                title = await self.llm.complete([{"role": "system", "content": TITLE_PROMPT}, {"role": "user", "content": first[:2000]}],
+                                             self.current_model(chat_id), max_tokens=30)
                 title = " ".join(title.split()).strip("\"'«».")
                 name = title[:128] or name
             except (LLMError, AttributeError):
