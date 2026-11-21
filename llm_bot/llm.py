@@ -16,6 +16,18 @@ class OpenRouter:
         self.api_key, self.model, self.client = api_key, model, client
         self.max_tokens, self.timeout = max_tokens, timeout
 
+    async def complete(self, messages: list[dict], max_tokens: int = 64) -> str:
+        """Short non-streamed completion, e.g. a topic title."""
+        body = {"model": self.model, "messages": messages, "max_tokens": max_tokens}
+        try:
+            response = await self.client.post(self.url, json=body, headers={"Authorization": "Bearer " + self.api_key}, timeout=60)
+            text = response.json()["choices"][0]["message"]["content"]
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
+            raise LLMError("OpenRouter: title request failed") from None
+        if response.status_code != 200 or not isinstance(text, str) or not text.strip():
+            raise LLMError("OpenRouter: empty title")
+        return text
+
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
         """Yield the accumulated answer text after every received delta."""
         body = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}

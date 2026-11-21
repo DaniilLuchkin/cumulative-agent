@@ -21,6 +21,10 @@ RICH_LIMIT = 32000  # sendRichMessage: up to 32768 characters
 TEXT_LIMIT = 4000   # sendMessage / sendMessageDraft: up to 4096 characters
 DEFAULT_PROMPT = ("You are a helpful assistant in a Telegram chat. Reply in the language of the user's last message. "
                   "Be concise unless asked for detail. Use Markdown: headings, lists, tables, fenced code blocks.")
+TITLE_PROMPT = ("Name this conversation in 2-5 words in the language of the user's message. "
+                "Reply with the title only, no quotes or trailing period.")
+SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
+                "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
 COMMANDS = [("new", "Новый диалог"), ("reset", "Очистить контекст"), ("help", "Справка")]
 
 
@@ -101,6 +105,12 @@ class Bot:
 
     # --- setup and polling ---------------------------------------------------------
 
+    async def refresh_topics(self) -> bool:
+        """Topic mode is switched in @BotFather; re-read it without a restart."""
+        me = await self.api.call("getMe")
+        self.topics_enabled = bool(me.get("has_topics_enabled"))
+        return self.topics_enabled
+
     async def configure(self):
         me = await self.api.call("getMe")
         self.topics_enabled = bool(me.get("has_topics_enabled"))
@@ -161,6 +171,14 @@ class Bot:
             return
         chat_id = chat["id"]
         thread_id = message.get("message_thread_id", 0) if message.get("is_topic_message") else 0
+        if thread_id:
+            self.topics_enabled = True
+            # A topic the user opened in the client gets a placeholder name; the bot renames it.
+            created = message.get("forum_topic_created") or (message.get("reply_to_message") or {}).get("forum_topic_created") or {}
+            if created.get("is_name_implicit") and not self.store.first_user_message(chat_id, thread_id):
+                self.store.set(f"autoname:{chat_id}:{thread_id}", True)
+        if any(key in message for key in SERVICE_KEYS):
+            return
         text = (message.get("text") or "").strip()
         if not text:
             await self.reply(chat_id, thread_id, "Пока понимаю только текстовые сообщения.")
@@ -179,11 +197,16 @@ class Bot:
             await self.answer(chat_id, thread_id, text, message["message_id"])
 
     async def new_topic(self, chat_id: int, thread_id: int, name: str):
-        if not self.topics_enabled:
+        if not self.topics_enabled and not await self.refresh_topics():
             self.store.clear(chat_id, thread_id)
-            await self.reply(chat_id, thread_id, "Начинаем заново — контекст очищен.")
+            await self.reply(chat_id, thread_id, "Начинаем заново — контекст очищен.\n"
+                             "Чтобы каждый диалог был в отдельном топике, включите для бота режим топиков в @BotFather.")
             return
-        topic = await self.api.call("createForumTopic", chat_id=chat_id, name=(name or "Новый чат")[:128])
+        try:
+            topic = await self.api.call("createForumTopic", chat_id=chat_id, name=(name or "Новый чат")[:128])
+        except TelegramError as exc:
+            await self.reply(chat_id, thread_id, "Не удалось создать топик: " + exc.description)
+            return
         new_thread = topic["message_thread_id"]
         if not name:
             self.store.set(f"autoname:{chat_id}:{new_thread}", True)
@@ -239,11 +262,19 @@ class Bot:
         if thread_id and self.store.get(key):
             self.store.set(key, False)
             first = " ".join((self.store.first_user_message(chat_id, thread_id) or "").split())
-            if first:
-                try:
-                    await self.api.call("editForumTopic", chat_id=chat_id, message_thread_id=thread_id, name=first[:60])
-                except TelegramError as exc:
-                    log.warning("topic rename failed: %s", exc.description)
+            if not first:
+                return
+            name = first[:60]
+            try:
+                title = await self.llm.complete([{"role": "system", "content": TITLE_PROMPT}, {"role": "user", "content": first[:2000]}], max_tokens=30)
+                title = " ".join(title.split()).strip("\"'«».")
+                name = title[:128] or name
+            except (LLMError, AttributeError):
+                pass  # keep the first message as the name
+            try:
+                await self.api.call("editForumTopic", chat_id=chat_id, message_thread_id=thread_id, name=name)
+            except TelegramError as exc:
+                log.warning("topic rename failed: %s", exc.description)
 
     # --- sending -------------------------------------------------------------------
 

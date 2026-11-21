@@ -32,6 +32,10 @@ class FakeLLM:
     def __init__(self, chunks=("Привет", ", **мир**", "!"), pause=0.02, error=None):
         self.chunks, self.pause, self.error, self.requests = chunks, pause, error, []
 
+    async def complete(self, messages, max_tokens=64):
+        self.titles = getattr(self, "titles", []) + [messages]
+        return "«Поездка в Казань.»"
+
     async def stream(self, messages):
         self.requests.append(messages)
         if self.error:
@@ -102,8 +106,41 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.api.sent("createForumTopic")[0]["name"], "Новый чат")
         self.assertEqual(self.api.sent("sendMessage")[-1]["message_thread_id"], 77)
         await self.bot.on_message(message("План поездки в Казань", 11, thread=77))
-        self.assertEqual(self.api.sent("editForumTopic")[0]["name"], "План поездки в Казань")
+        self.assertEqual(self.api.sent("editForumTopic")[0]["name"], "Поездка в Казань")
         self.assertEqual(self.api.sent("sendRichMessage")[-1]["message_thread_id"], 77)
+
+    async def test_user_created_topic_with_implicit_name_is_renamed_once(self):
+        service = message("", 30, thread=88)
+        service.pop("text")
+        service["forum_topic_created"] = {"name": "New chat", "icon_color": 7322096, "is_name_implicit": True}
+        await self.bot.on_message(service)
+        self.assertFalse(self.api.sent("sendMessage"))  # service messages get no reply
+        await self.bot.on_message(message("Как сварить борщ", 31, thread=88))
+        await self.bot.on_message(message("А без свёклы?", 32, thread=88))
+        renames = self.api.sent("editForumTopic")
+        self.assertEqual([(r["message_thread_id"], r["name"]) for r in renames], [(88, "Поездка в Казань")])
+
+    async def test_title_failure_falls_back_to_first_message(self):
+        async def broken(messages, max_tokens=64):
+            raise LLMError("down")
+        self.llm.complete = broken
+        first = message("Вопрос про налоги", 40, thread=90)
+        first["reply_to_message"] = {"message_id": 39, "forum_topic_created": {"name": "New chat", "is_name_implicit": True}}
+        await self.bot.on_message(first)
+        self.assertEqual(self.api.sent("editForumTopic")[0]["name"], "Вопрос про налоги")
+
+    async def test_explicitly_named_topic_is_not_renamed(self):
+        first = message("Вопрос", 50, thread=91)
+        first["reply_to_message"] = {"message_id": 49, "forum_topic_created": {"name": "Работа"}}
+        await self.bot.on_message(first)
+        self.assertFalse(self.api.sent("editForumTopic"))
+
+    async def test_topics_enabled_later_are_picked_up_by_new(self):
+        self.api.topics = False
+        await self.bot.configure()
+        self.api.topics = True
+        await self.bot.on_message(message("/new", 60))
+        self.assertTrue(self.api.sent("createForumTopic"))
 
     async def test_new_without_topics_resets(self):
         self.api.topics = False

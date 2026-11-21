@@ -12,7 +12,7 @@
 | Ответ набирается в реальном времени, с форматированием | `sendRichMessageDraft` (`markdown`) каждые 0,8 с; черновик обновляется раньше, чем истекут его 30 с |
 | Кнопка «Стоп» под черновиком | `can_stop: true` → update `stopped_message_generation` → вызов модели отменяется, частичный ответ сохраняется |
 | Итоговый ответ остаётся в чате: заголовки, таблицы, код | `sendRichMessage` (до 32768 символов), ответ на сообщение пользователя; при ошибке — `sendMessage` частями по 4000 |
-| Отдельные диалоги в топиках | `/new` → `createForumTopic`, имя по первому вопросу через `editForumTopic`; контекст свой у каждого топика |
+| Отдельные диалоги в топиках | Свой контекст у каждого топика. `/new` → `createForumTopic`. Топик, созданный в клиенте (`forum_topic_created.is_name_implicit`) или через `/new` без имени, после первого ответа получает название от модели (`editForumTopic`) |
 | Подсказки команд | `setMyCommands`: `/new`, `/reset`, `/help` |
 
 Бот работает только в личном чате. Доступ есть у пользователей из `ALLOWED_USER_IDS`,
@@ -35,7 +35,8 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 
 * Настройки: `/etc/llm-bot.env`. После изменения: `sudo systemctl restart llm-bot`.
 * Логи: `journalctl -u llm-bot -f`.
-* Для топиков включите для бота режим топиков в @BotFather и перезапустите сервис.
+* Топики: в @BotFather откройте Mini App → бот → Bot Settings и включите режим топиков
+  (threaded mode). Перезапуск не нужен: `/new` перепроверяет режим через `getMe`.
 
 | Переменная | По умолчанию | |
 |---|---|---|
