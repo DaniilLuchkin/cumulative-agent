@@ -20,9 +20,9 @@ LLM-агент для Telegram, собранный из возможностей
 | Отдельные диалоги в топиках, названия ставит модель | `createForumTopic`, `editForumTopic`, `forum_topic_created.is_name_implicit` |
 | `@бот вопрос` в любом чате | Inline mode: `answerInlineQuery` → `chosen_inline_result` → ответ дописывается в сообщение через `editMessageText(inline_message_id)` |
 | Упоминание `@бот` в чате, где бота нет (с контекстом сообщения, на которое ответили) | Guest Mode: update `guest_message` → `answerGuestQuery` → правка `inline_message_id` |
-| `/info` — справочник по всем возможностям: разделы, таблица форматов, сворачиваемые блоки и кнопки «Настройки / Часовой пояс / Мои задачи / Новый диалог» | `sendRichMessage` (Rich Markdown, `<details>`), inline-клавиатура |
-| `/settings` — **🤖 Выбрать модель** (DeepSeek V4.1 Flash или GPT-6.2 Sol, с ценами; «← Назад») и **🕒 Указать часовой пояс**; если пояс задан — «Сбросить на UTC» | inline-клавиатура, правка сообщения на месте (`editMessageText`) |
-| Часовой пояс — кнопка в `/settings`, `/timezone` или геолокация в чат. Геолокация не сохраняется: хранится только название пояса; по умолчанию UTC | `KeyboardButton.request_location`; пояс определяет open-meteo.com по координатам, округлённым до ~10 км; при ошибке — по долготе |
+| `/info` — справочник по всем возможностям: разделы, таблица форматов, сворачиваемые блоки и кнопки «Настройки / Локация / Мои задачи / Новый диалог» | `sendRichMessage` (Rich Markdown, `<details>`), inline-клавиатура |
+| `/settings` — две кнопки: **🤖 Set model** (DeepSeek V4.1 Flash или GPT-6.2 Sol, с ценами; «← Назад») и **📍 Set timezone/location** | inline-клавиатура, правка сообщения на месте (`editMessageText`) |
+| Локация — кнопка в `/settings`, `/location` (или `/timezone`) или просто геолокация в чат. Координаты сохраняются (`location:<chat>` в SQLite: широта, долгота, пояс, время), по ним ставится часовой пояс; без локации — UTC | `KeyboardButton.request_location`; пояс определяет open-meteo.com по координатам, округлённым до ~10 км; при ошибке — по долготе |
 
 Агенту доступны инструменты: `set_reminder`, `start_watch`, `list_scheduled`,
 `cancel_scheduled` и серверные `openrouter:web_search` / `openrouter:web_fetch`. Если
@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 | `ALLOWED_USER_IDS` | пусто | ID через запятую |
 | `UTILITY_MODEL` | `deepseek/deepseek-v4.1-flash` | названия топиков и вопросы под ответом |
 | `TRANSCRIBE_MODEL` | `openai/whisper-large-v3-turbo` | голосовые |
-| `TIMEZONE` | `UTC` | пояс, пока пользователь не задал свой |
+| `TIMEZONE` | `UTC` | пояс, пока локация не указана |
 | `SUGGESTIONS` | `on` | `off` — без вопросов под ответом (на 1 запрос меньше) |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
 | `MAX_OUTPUT_TOKENS` | 4096 | |
