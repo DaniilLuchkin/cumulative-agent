@@ -1,0 +1,30 @@
+[Unit]
+Description=Telegram LLM bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=/etc/llm-bot.env
+Environment=BOT_DB=/var/lib/llm-bot/bot.sqlite3
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/llm-bot/.venv/bin/llm-bot
+Restart=always
+RestartSec=5
+StateDirectory=llm-bot
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
