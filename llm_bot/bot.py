@@ -21,7 +21,7 @@ from datetime import datetime
 from html import escape
 from zoneinfo import ZoneInfo
 
-from . import media
+from . import geo, media
 from .agent import Agent
 from .inline import Surfaces
 from .llm import FILE_PLUGIN, LLMError
@@ -38,6 +38,8 @@ DEFAULT_PROMPT = ("You are a helpful personal assistant in a Telegram chat. Repl
                   "<details> for long optional parts, footnotes for sources. "
                   "You can set reminders and start background watches with your tools, and search the web for current facts.")
 CONTEXT_PROMPT = "Current local time of the user: {now} ({zone})."
+UNKNOWN_ZONE_PROMPT = ("The user's time zone is not set, UTC is assumed. When times of day matter (reminders, schedules), "
+                       "say that the user can send their location to set the time zone.")
 TITLE_PROMPT = ("Name this conversation in 2-5 words in the language of the user's message. "
                 "Reply with the title only, no quotes or trailing period.")
 SUGGEST_PROMPT = ("Suggest 3 short follow-up questions the user may ask next, in the user's language, each under 40 characters. "
@@ -47,11 +49,9 @@ TOOL_STATUS = {"set_reminder": "Ставлю напоминание…", "start_
 SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
 COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("reset", "Очистить контекст"),
-            ("settings", "Модель и часовой пояс"), ("help", "Справка")]
+            ("settings", "Модель"), ("timezone", "Часовой пояс по геолокации"), ("help", "Справка")]
 # Shown in /settings; override with LLM_MODELS (comma-separated OpenRouter ids).
-DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4-pro", "google/gemini-4-hydrogen",
-                  "openai/gpt-6.2-sol", "anthropic/claude-fable-5.2"]
-TIMEZONES = ["Europe/Kaliningrad", "Europe/Moscow", "Europe/Samara", "Asia/Yekaterinburg", "Asia/Novosibirsk", "Europe/Berlin", "UTC"]
+DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"]
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
                    "guest_message", "stopped_message_generation"]
 
@@ -64,7 +64,7 @@ class Config:
     models: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
     utility_model: str = "deepseek/deepseek-v4.1-flash"     # titles and follow-up suggestions
     transcribe_model: str = "openai/whisper-large-v3-turbo"
-    timezone: str = "Europe/Moscow"
+    timezone: str = "UTC"
     system_prompt: str = DEFAULT_PROMPT
     allowed_ids: set[int] = field(default_factory=set)
     database: str = "data/bot.sqlite3"
@@ -267,6 +267,9 @@ class Bot:
                 self.store.set(f"autoname:{chat_id}:{thread_id}", True)
         if any(key in message for key in SERVICE_KEYS):
             return
+        if message.get("location"):
+            await self.set_location(chat_id, thread_id, message["location"], message.get("message_id"))
+            return
         text = (message.get("text") or "").strip()
         command = text.split()[0].split("@")[0].lower() if text.startswith("/") else None
         if command:
@@ -292,11 +295,18 @@ class Bot:
                              "Пишите, присылайте фото, PDF или голосовые — ответ появляется по мере генерации, его можно остановить.\n"
                              "Могу напомнить («напомни завтра в 9 позвонить врачу») и следить за чем-то в фоне («следи за новостями о …»).\n"
                              "Исправьте своё сообщение — перепишу ответ.\n\n" + topics +
-                             "/tasks — напоминания и фоновые задачи.\n/reset — очистить контекст.\n/settings — модель и часовой пояс.\n"
+                             "/tasks — напоминания и фоновые задачи.\n/reset — очистить контекст.\n/settings — модель.\n"
+                             "/timezone — часовой пояс: пришлите геолокацию.\n"
                              f"В любом чате: @{self.username} вопрос.")
         elif command in ("/settings", "/model"):
             await self.api.call("sendMessage", text=self.settings_text(chat_id), reply_markup=self.settings_keyboard(chat_id),
                                 **self._target(chat_id, thread_id, None))
+        elif command == "/timezone":
+            keyboard = {"keyboard": [[{"text": "📍 Отправить геолокацию", "request_location": True}]],
+                        "resize_keyboard": True, "one_time_keyboard": True, "input_field_placeholder": "Геолокация задаст часовой пояс"}
+            await self.api.call("sendMessage", reply_markup=keyboard, **self._target(chat_id, thread_id, None),
+                                text=f"Сейчас: {self.zone_label(chat_id)}. Нажмите кнопку ниже или пришлите геолокацию "
+                                     "через 📎 → Геопозиция — по ней определю часовой пояс. Координаты не сохраняются.")
         elif command == "/tasks":
             text, markup = self.agent.list_markup(chat_id)
             await self.api.call("sendMessage", text=text, reply_markup=markup, **self._target(chat_id, thread_id, None))
@@ -348,7 +358,10 @@ class Bot:
     def system_message(self, chat_id: int) -> dict:
         zone = self.zone(chat_id)
         now = datetime.now(zone).strftime("%A %Y-%m-%d %H:%M")
-        return {"role": "system", "content": self.config.system_prompt + "\n" + CONTEXT_PROMPT.format(now=now, zone=zone.key)}
+        content = self.config.system_prompt + "\n" + CONTEXT_PROMPT.format(now=now, zone=zone.key)
+        if not self.store.get(f"timezone:{chat_id}") and not os.environ.get("TIMEZONE"):
+            content += "\n" + UNKNOWN_ZONE_PROMPT
+        return {"role": "system", "content": content}
 
     async def answer(self, chat_id: int, thread_id: int, content: media.Input, message_id: int | None,
                      prefix: str = "", user_row: int | None = None):
@@ -491,8 +504,6 @@ class Bot:
         if self.allowed(user.get("id")):
             if data.startswith("model:"):
                 toast = await self.choose_model(query, data)
-            elif data.startswith("tz:"):
-                toast = await self.choose_timezone(query, data)
             elif data.startswith("regen:"):
                 turn = self.store.turn(int(data[6:])) if data[6:].isdigit() else None
                 if not turn or not self.store.is_latest(turn):
@@ -520,18 +531,33 @@ class Bot:
 
     def settings_text(self, chat_id: int) -> str:
         model = self.current_model(chat_id)
-        return (f"Модель: {model}{self.price(model)}\nЧасовой пояс: {self.zone(chat_id).key}\n"
-                "Цена — $ за 1 млн токенов: ввод/вывод. Выбор действует во всех диалогах.")
+        return (f"Модель: {model}{self.price(model)}\nЦена — $ за 1 млн токенов: ввод/вывод. Выбор действует во всех диалогах.\n\n"
+                f"Часовой пояс: {self.zone_label(chat_id)}. Чтобы изменить — пришлите геолокацию (📎 → Геопозиция) или /timezone.")
+
+    def zone_label(self, chat_id: int) -> str:
+        zone = self.zone(chat_id)
+        offset = datetime.now(zone).utcoffset()
+        hours = offset.total_seconds() / 3600 if offset else 0
+        return f"{zone.key} (UTC{hours:+g})" if hours else f"{zone.key}"
+
+    async def set_location(self, chat_id: int, thread_id: int, location: dict, message_id: int | None):
+        try:
+            lat, lon = float(location["latitude"]), float(location["longitude"])
+        except (KeyError, TypeError, ValueError):
+            return
+        name, exact = await geo.timezone_at(getattr(self.api, "client", None), lat, lon)
+        self.store.set(f"timezone:{chat_id}", name)
+        log.info("chat %s time zone set to %s (exact=%s)", chat_id, name, exact)
+        note = "" if exact else " Точный пояс определить не удалось — взял по долготе."
+        await self.react(chat_id, message_id, "👌")
+        await self.api.call("sendMessage", text=f"Часовой пояс: {self.zone_label(chat_id)}.{note}",
+                            reply_markup={"remove_keyboard": True}, **self._target(chat_id, thread_id, message_id))
 
     def settings_keyboard(self, chat_id: int) -> dict:
-        current, zone = self.current_model(chat_id), self.zone(chat_id).key
-        rows = [[{"text": ("✓ " if model == current else "") + model.split("/")[-1] + self.price(model),
-                  "callback_data": f"model:{index}", **({"style": "primary"} if model == current else {})}]
-                for index, model in enumerate(self.models)]
-        zones = [{"text": ("✓ " if name == zone else "") + name.split("/")[-1].replace("_", " "), "callback_data": f"tz:{index}"}
-                 for index, name in enumerate(TIMEZONES)]
-        rows += [zones[i:i + 4] for i in range(0, len(zones), 4)]
-        return {"inline_keyboard": rows}
+        current = self.current_model(chat_id)
+        return {"inline_keyboard": [[{"text": ("✓ " if model == current else "") + model.split("/")[-1] + self.price(model),
+                                      "callback_data": f"model:{index}", **({"style": "primary"} if model == current else {})}]
+                                    for index, model in enumerate(self.models)]}
 
     async def choose_model(self, query: dict, data: str) -> str:
         try:
@@ -543,16 +569,6 @@ class Bot:
         log.info("chat %s switched model to %s", chat_id, model)
         await self.edit_settings(query, chat_id)
         return "Модель: " + model.split("/")[-1]
-
-    async def choose_timezone(self, query: dict, data: str) -> str:
-        try:
-            zone = TIMEZONES[int(data.removeprefix("tz:"))]
-        except (ValueError, IndexError):
-            return "Кнопка устарела"
-        chat_id = (query.get("message") or {}).get("chat", {}).get("id", query["from"]["id"])
-        self.store.set(f"timezone:{chat_id}", zone)
-        await self.edit_settings(query, chat_id)
-        return "Часовой пояс: " + zone
 
     async def edit_settings(self, query: dict, chat_id: int):
         message = query.get("message") or {}

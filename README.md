@@ -20,7 +20,8 @@ LLM-агент для Telegram, собранный из возможностей
 | Отдельные диалоги в топиках, названия ставит модель | `createForumTopic`, `editForumTopic`, `forum_topic_created.is_name_implicit` |
 | `@бот вопрос` в любом чате | Inline mode: `answerInlineQuery` → `chosen_inline_result` → ответ дописывается в сообщение через `editMessageText(inline_message_id)` |
 | Упоминание `@бот` в чате, где бота нет (с контекстом сообщения, на которое ответили) | Guest Mode: update `guest_message` → `answerGuestQuery` → правка `inline_message_id` |
-| `/settings` — модель с ценой и часовой пояс | inline-клавиатура, `editMessageText` |
+| `/settings` — модель с ценой (DeepSeek V4.1 Flash или GPT-6.2 Sol) | inline-клавиатура, `editMessageText` |
+| Часовой пояс — по умолчанию UTC; пришлите геолокацию (или `/timezone` → кнопка «📍 Отправить геолокацию») | `KeyboardButton.request_location`; пояс по координатам, округлённым до ~10 км, определяет open-meteo.com (без ключа), координаты не хранятся; при ошибке — по долготе |
 
 Агенту доступны инструменты: `set_reminder`, `start_watch`, `list_scheduled`,
 `cancel_scheduled` и серверные `openrouter:web_search` / `openrouter:web_fetch`. Если
@@ -61,11 +62,11 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 | `TELEGRAM_BOT_TOKEN` | — | обязательна |
 | `OPENROUTER_API_KEY` | — | обязательна |
 | `LLM_MODEL` | модель из старого `cumulative-agent.yaml`, иначе `openrouter/auto` | любой id с openrouter.ai/models; фактическая модель пишется в лог |
-| `LLM_MODELS` | DeepSeek V4.1 Flash, DeepSeek V4 Pro, Gemini 4 Hydrogen, GPT-6.2 Sol, Claude Fable 5.2 | список для `/settings` через запятую; `LLM_MODEL` добавляется всегда |
+| `LLM_MODELS` | `deepseek/deepseek-v4.1-flash`, `openai/gpt-6.2-sol` | список для `/settings` через запятую; `LLM_MODEL` добавляется всегда |
 | `ALLOWED_USER_IDS` | пусто | ID через запятую |
 | `UTILITY_MODEL` | `deepseek/deepseek-v4.1-flash` | названия топиков и вопросы под ответом |
 | `TRANSCRIBE_MODEL` | `openai/whisper-large-v3-turbo` | голосовые |
-| `TIMEZONE` | `Europe/Moscow` | по умолчанию; меняется в `/settings` |
+| `TIMEZONE` | `UTC` | по умолчанию; меняется геолокацией |
 | `SUGGESTIONS` | `on` | `off` — без вопросов под ответом (на 1 запрос меньше) |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
 | `MAX_OUTPUT_TOKENS` | 4096 | |

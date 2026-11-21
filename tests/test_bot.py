@@ -120,7 +120,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_and_topics_detected(self):
         self.assertTrue(self.bot.topics_enabled)
         commands = self.api.sent("setMyCommands")[0]
-        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "reset", "settings", "help"])
+        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "reset", "settings", "timezone", "help"])
 
     async def test_streams_thinking_then_drafts_then_rich_answer_with_reactions(self):
         await self.bot.on_message(message("Как дела?"))
@@ -300,16 +300,43 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     # --- settings -------------------------------------------------------------------
 
-    async def test_settings_switches_model_and_timezone(self):
+    async def test_settings_lists_two_models_and_switches(self):
+        self.assertEqual(self.bot.models, ["openrouter/auto", "deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"])
         await self.bot.on_message(message("/settings"))
-        keyboard = self.api.sent("sendMessage")[-1]["reply_markup"]["inline_keyboard"]
+        sent = self.api.sent("sendMessage")[-1]
+        keyboard = sent["reply_markup"]["inline_keyboard"]
+        self.assertEqual(len(keyboard), 3)
+        self.assertIn("Часовой пояс: UTC", sent["text"])
         flash = self.bot.models.index("deepseek/deepseek-v4.1-flash")
         self.assertIn("$0.05/$0.20", keyboard[flash][0]["text"])
         await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": f"model:{flash}", "message": {"message_id": 5, "chat": {"id": 123}}})
-        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "tz:4", "message": {"message_id": 5, "chat": {"id": 123}}})
-        self.assertEqual(self.bot.zone(123).key, "Asia/Novosibirsk")
         await self.bot.on_message(message("Привет", 11))
         self.assertEqual(self.llm.models[-1], "deepseek/deepseek-v4.1-flash")
+
+    async def test_default_timezone_is_utc_and_model_is_told_it_is_unset(self):
+        self.assertEqual(self.bot.zone(123).key, "UTC")
+        await self.bot.on_message(message("Привет"))
+        self.assertIn("time zone is not set", self.llm.requests[-1][0]["content"])
+
+    async def test_location_sets_timezone(self):
+        async def lookup(client, lat, lon):
+            self.looked_up = (lat, lon)
+            return "Asia/Novosibirsk", True
+        original, __import__("llm_bot.geo").geo.timezone_at = __import__("llm_bot.geo").geo.timezone_at, lookup
+        try:
+            await self.bot.on_message(message("/timezone"))
+            button = self.api.sent("sendMessage")[-1]["reply_markup"]["keyboard"][0][0]
+            self.assertTrue(button["request_location"])
+            await self.bot.on_message(message(None, 11, location={"latitude": 55.03, "longitude": 82.92}))
+        finally:
+            __import__("llm_bot.geo").geo.timezone_at = original
+        self.assertEqual(self.bot.zone(123).key, "Asia/Novosibirsk")
+        reply = self.api.sent("sendMessage")[-1]
+        self.assertEqual(reply["text"], "Часовой пояс: Asia/Novosibirsk (UTC+7).")
+        self.assertEqual(reply["reply_markup"], {"remove_keyboard": True})
+        self.assertEqual(self.llm.requests, [])  # a location is not a question
+        await self.bot.on_message(message("Привет", 12))
+        self.assertNotIn("time zone is not set", self.llm.requests[-1][0]["content"])
 
     async def test_strangers_cannot_press_buttons(self):
         await self.bot.on_message(message("Привет"))
@@ -372,6 +399,21 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Bonjour à tous", self.llm.requests[-1][-1]["content"])
         self.assertTrue(self.llm.requests[-1][-1]["content"].endswith("переведи"))
         self.assertEqual(self.api.sent("editMessageText")[-1]["inline_message_id"], "guest-1")
+
+    async def test_geo_lookup_rounds_coordinates_and_falls_back(self):
+        from llm_bot import geo
+        seen = []
+
+        def handler(request):
+            seen.append(dict(request.url.params))
+            return httpx.Response(200, json={"timezone": "Europe/Moscow"})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            self.assertEqual(await geo.timezone_at(client, 55.7558, 37.6173), ("Europe/Moscow", True))
+        self.assertEqual((seen[0]["latitude"], seen[0]["longitude"]), ("55.8", "37.6"))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500))) as client:
+            self.assertEqual(await geo.timezone_at(client, 55.7, 37.6), ("Etc/GMT-3", False))
+        self.assertEqual(geo.by_longitude(-74), "Etc/GMT+5")
+        self.assertEqual(geo.by_longitude(1), "UTC")
 
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])
