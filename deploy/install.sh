@@ -2,6 +2,7 @@
 # Install or update the Telegram LLM bot on Ubuntu as the systemd service llm-bot.
 #   curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/deploy/install.sh | sudo bash
 # Re-running updates the code and keeps /etc/llm-bot.env and the conversation history.
+# Keys are taken from an existing /etc/cumulative-agent.env when present.
 set -euo pipefail
 ref=${BOT_REF:-Alt}
 repo=${REPO_URL:-https://github.com/DaniilLuchkin/cumulative-agent.git}
@@ -14,26 +15,34 @@ work=$(mktemp -d)
 trap 'rm -rf "${work}"' EXIT
 git clone --quiet --depth 1 --branch "${ref}" "${repo}" "${work}/src"
 
+old_env=/etc/cumulative-agent.env
+old_db=/var/lib/cumulative-agent/agent.sqlite3
+
+# Value of KEY from an env file, without sourcing it.
+env_value() { [[ -f $2 ]] && sed -n "s/^$1=//p" "$2" | tail -n 1 | tr -d '\r' || true; }
+
 if [[ ! -f ${env_file} ]]; then
-    read -rsp "Telegram bot token (from @BotFather): " token </dev/tty; echo
-    read -rsp "OpenRouter API key: " key </dev/tty; echo
-    read -rp "Model [openrouter/auto]: " model </dev/tty
-    read -rp "Allowed Telegram user IDs, comma-separated (empty: the first user who writes): " ids </dev/tty
+    # Reuse the keys of the previous cumulative-agent installation when present.
+    token=$(env_value TELEGRAM_BOT_TOKEN "${old_env}")
+    key=$(env_value OPENROUTER_API_KEY "${old_env}")
+    ids=$(env_value TELEGRAM_OWNER_IDS "${old_env}")
+    if [[ -z ${ids} && -f ${old_db} ]]; then
+        ids=$(python3 -c "import sqlite3,sys; r=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True).execute(\"SELECT value FROM settings WHERE key='telegram_claimed_owner'\").fetchone(); print(r[0] if r else '')" "${old_db}" 2>/dev/null || true)
+    fi
+    [[ -n ${token} ]] && echo "Using Telegram token from ${old_env}" || { read -rsp "Telegram bot token (from @BotFather): " token </dev/tty; echo; }
+    [[ -n ${key} ]] && echo "Using OpenRouter key from ${old_env}" || { read -rsp "OpenRouter API key: " key </dev/tty; echo; }
     [[ -n ${token} && -n ${key} ]] || { echo "Token and key are required" >&2; exit 1; }
     ( umask 077
       printf 'TELEGRAM_BOT_TOKEN=%s\nOPENROUTER_API_KEY=%s\nLLM_MODEL=%s\nALLOWED_USER_IDS=%s\n' \
-          "${token}" "${key}" "${model:-openrouter/auto}" "${ids}" > "${env_file}" )
-    echo "Settings saved to ${env_file}"
+          "${token}" "${key}" "${LLM_MODEL:-openrouter/auto}" "${ids}" > "${env_file}" )
+    echo "Settings saved to ${env_file}${ids:+ (allowed user: ${ids})}"
 fi
 
-# Telegram delivers updates to one poller only; the old agent uses the same bot.
-if systemctl is-active --quiet cumulative-agent 2>/dev/null; then
-    read -rp "cumulative-agent is running and would compete for the same bot. Stop and disable it? [y/N] " answer </dev/tty
-    if [[ ${answer} =~ ^[Yy] ]]; then
-        systemctl disable --now cumulative-agent
-    else
-        echo "Warning: both services will compete for updates if they use the same token." >&2
-    fi
+# Telegram delivers updates to one poller only. The old agent is stopped, not deleted:
+# its code, settings and database stay in place for a later return.
+if systemctl is-enabled --quiet cumulative-agent 2>/dev/null || systemctl is-active --quiet cumulative-agent 2>/dev/null; then
+    systemctl disable --now cumulative-agent
+    echo "Stopped cumulative-agent (files kept; return: sudo systemctl disable --now llm-bot && sudo systemctl enable --now cumulative-agent)"
 fi
 
 install -d -m 755 "${app}"

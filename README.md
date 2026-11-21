@@ -25,10 +25,13 @@
 curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/deploy/install.sh | sudo bash
 ```
 
-Скрипт спросит токен бота, ключ OpenRouter, модель и разрешённые ID и поставит
-systemd-сервис `llm-bot`. Если на сервере запущен `cumulative-agent` с тем же ботом,
-скрипт предложит его остановить: Telegram отдаёт обновления только одному получателю.
-Повторный запуск обновляет код и сохраняет настройки и историю.
+Если на сервере стоял `cumulative-agent`, скрипт берёт из `/etc/cumulative-agent.env`
+токен бота и ключ OpenRouter, а ID владельца — из его конфигурации или БД. Ничего
+спрашивать не будет. Старый сервис останавливается и отключается: Telegram отдаёт
+обновления только одному получателю. Его код, настройки и БД остаются на месте.
+Вернуться: `sudo systemctl disable --now llm-bot && sudo systemctl enable --now cumulative-agent`.
+На чистом сервере скрипт спросит токен и ключ. Повторный запуск обновляет код и
+сохраняет настройки и историю.
 
 * Настройки: `/etc/llm-bot.env`. После изменения: `sudo systemctl restart llm-bot`.
 * Логи: `journalctl -u llm-bot -f`.
