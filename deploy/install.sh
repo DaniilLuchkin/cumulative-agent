@@ -29,12 +29,30 @@ if [[ ! -f ${env_file} ]]; then
     if [[ -z ${ids} && -f ${old_db} ]]; then
         ids=$(python3 -c "import sqlite3,sys; r=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True).execute(\"SELECT value FROM settings WHERE key='telegram_claimed_owner'\").fetchone(); print(r[0] if r else '')" "${old_db}" 2>/dev/null || true)
     fi
+    # The old agent kept its models in YAML: take the first enabled OpenRouter model.
+    model=${LLM_MODEL:-}
+    if [[ -z ${model} && -f /etc/cumulative-agent.yaml ]]; then
+        model=$(python3 - /etc/cumulative-agent.yaml <<'PY' 2>/dev/null || true
+import re, sys
+text = open(sys.argv[1]).read()
+try:
+    import yaml
+    models = (yaml.safe_load(text) or {}).get("models") or []
+    print(next((m["id"] for m in models if m.get("enabled") and m.get("provider", "openrouter") == "openrouter"), ""))
+except ImportError:
+    for block in re.split(r"\n\s*-\s+(?=id:)", text)[1:]:
+        if re.search(r"^\s*enabled:\s*true", block, re.M):
+            print(re.match(r"id:\s*['\"]?([^\s'\"#]+)", block).group(1)); break
+PY
+)
+        [[ -n ${model} ]] && echo "Using model ${model} from /etc/cumulative-agent.yaml"
+    fi
     [[ -n ${token} ]] && echo "Using Telegram token from ${old_env}" || { read -rsp "Telegram bot token (from @BotFather): " token </dev/tty; echo; }
     [[ -n ${key} ]] && echo "Using OpenRouter key from ${old_env}" || { read -rsp "OpenRouter API key: " key </dev/tty; echo; }
     [[ -n ${token} && -n ${key} ]] || { echo "Token and key are required" >&2; exit 1; }
     ( umask 077
       printf 'TELEGRAM_BOT_TOKEN=%s\nOPENROUTER_API_KEY=%s\nLLM_MODEL=%s\nALLOWED_USER_IDS=%s\n' \
-          "${token}" "${key}" "${LLM_MODEL:-openrouter/auto}" "${ids}" > "${env_file}" )
+          "${token}" "${key}" "${model:-openrouter/auto}" "${ids}" > "${env_file}" )
     echo "Settings saved to ${env_file}${ids:+ (allowed user: ${ids})}"
 fi
 

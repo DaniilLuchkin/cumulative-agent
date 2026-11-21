@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | обязательна |
 | `OPENROUTER_API_KEY` | — | обязательна |
-| `LLM_MODEL` | `openrouter/auto` | любой id с openrouter.ai/models |
+| `LLM_MODEL` | модель из старого `cumulative-agent.yaml`, иначе `openrouter/auto` | любой id с openrouter.ai/models; фактическая модель пишется в лог |
 | `ALLOWED_USER_IDS` | пусто | ID через запятую |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
 | `MAX_OUTPUT_TOKENS` | 4096 | |

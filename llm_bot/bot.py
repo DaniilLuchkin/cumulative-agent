@@ -238,6 +238,7 @@ class Bot:
             if error:
                 await self.reply(chat_id, thread_id, "Не удалось получить ответ: " + error, message_id)
                 return
+            log.info("answered in chat %s topic %s with %s", chat_id, thread_id, getattr(self.llm, "last_model", None) or self.config.model)
             result = draft.text.strip()
             if result:
                 self.store.add(chat_id, thread_id, "assistant", result)
