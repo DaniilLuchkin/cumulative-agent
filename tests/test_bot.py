@@ -120,7 +120,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_and_topics_detected(self):
         self.assertTrue(self.bot.topics_enabled)
         commands = self.api.sent("setMyCommands")[0]
-        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "reset", "settings", "timezone", "info", "help"])
+        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "reset", "settings", "location", "info", "help"])
 
     async def test_streams_thinking_then_drafts_then_rich_answer_with_reactions(self):
         await self.bot.on_message(message("Как дела?"))
@@ -300,16 +300,26 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     # --- settings -------------------------------------------------------------------
 
-    async def test_settings_lists_two_models_and_switches(self):
+    async def test_settings_has_two_buttons_and_a_model_view(self):
         self.assertEqual(self.bot.models, ["openrouter/auto", "deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"])
         await self.bot.on_message(message("/settings"))
         sent = self.api.sent("sendMessage")[-1]
-        keyboard = sent["reply_markup"]["inline_keyboard"]
-        self.assertEqual(len(keyboard), 3)
+        self.assertEqual([row[0]["callback_data"] for row in sent["reply_markup"]["inline_keyboard"]], ["settings:model", "settings:location"])
+        self.assertIn("Локация: не указана", sent["text"])
         self.assertIn("Часовой пояс: UTC", sent["text"])
+        press = lambda data: self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": data, "message": {"message_id": 5, "chat": {"id": 123}}})
+        await press("settings:model")
+        view = self.api.sent("editMessageText")[-1]
+        rows = view["reply_markup"]["inline_keyboard"]
         flash = self.bot.models.index("deepseek/deepseek-v4.1-flash")
-        self.assertIn("$0.05/$0.20", keyboard[flash][0]["text"])
-        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": f"model:{flash}", "message": {"message_id": 5, "chat": {"id": 123}}})
+        self.assertIn("$0.05/$0.20", rows[flash][0]["text"])
+        self.assertEqual(rows[-1][0]["callback_data"], "settings:main")
+        await press(f"model:{flash}")
+        main = self.api.sent("editMessageText")[-1]
+        self.assertIn("Модель: deepseek/deepseek-v4.1-flash", main["text"])
+        self.assertEqual(main["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "settings:model")
+        await press("settings:location")
+        self.assertTrue(self.api.sent("sendMessage")[-1]["reply_markup"]["keyboard"][0][0]["request_location"])
         await self.bot.on_message(message("Привет", 11))
         self.assertEqual(self.llm.models[-1], "deepseek/deepseek-v4.1-flash")
 
@@ -318,13 +328,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_message(message("Привет"))
         self.assertIn("time zone is not set", self.llm.requests[-1][0]["content"])
 
-    async def test_location_sets_timezone(self):
+    async def test_location_is_saved_and_sets_timezone(self):
         async def lookup(client, lat, lon):
             self.looked_up = (lat, lon)
             return "Asia/Novosibirsk", True
         original, __import__("llm_bot.geo").geo.timezone_at = __import__("llm_bot.geo").geo.timezone_at, lookup
         try:
-            await self.bot.on_message(message("/timezone"))
+            await self.bot.on_message(message("/location"))
             button = self.api.sent("sendMessage")[-1]["reply_markup"]["keyboard"][0][0]
             self.assertTrue(button["request_location"])
             await self.bot.on_message(message(None, 11, location={"latitude": 55.03, "longitude": 82.92}))
@@ -332,10 +342,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             __import__("llm_bot.geo").geo.timezone_at = original
         self.assertEqual(self.bot.zone(123).key, "Asia/Novosibirsk")
         reply = self.api.sent("sendMessage")[-1]
-        self.assertEqual(reply["text"], "Часовой пояс: Asia/Novosibirsk (UTC+7).")
+        self.assertEqual(reply["text"], "📍 Локация сохранена. Часовой пояс: Asia/Novosibirsk (UTC+7).")
+        saved = self.bot.location(123)
+        self.assertEqual((saved["latitude"], saved["longitude"], saved["timezone"]), (55.03, 82.92, "Asia/Novosibirsk"))
+        await self.bot.on_message(message("/settings", 13))
+        self.assertIn("Локация: 55.0300, 82.9200", self.api.sent("sendMessage")[-1]["text"])
         self.assertEqual(reply["reply_markup"], {"remove_keyboard": True})
         self.assertEqual(self.llm.requests, [])  # a location is not a question
-        await self.bot.on_message(message("Привет", 12))
+        await self.bot.on_message(message("Привет", 14))
         self.assertNotIn("time zone is not set", self.llm.requests[-1][0]["content"])
 
     async def test_strangers_cannot_press_buttons(self):
@@ -425,8 +439,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("часовой пояс **UTC**", text)
         self.assertEqual(self.llm.requests, [])
         buttons = [b["callback_data"] for row in sent["reply_markup"]["inline_keyboard"] for b in row]
-        self.assertEqual(buttons, ["cmd:settings", "cmd:timezone", "cmd:tasks", "cmd:new"])
-        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "cmd:timezone", "message": {"message_id": 5, "chat": {"id": 123}}})
+        self.assertEqual(buttons, ["cmd:settings", "cmd:location", "cmd:tasks", "cmd:new"])
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "cmd:location", "message": {"message_id": 5, "chat": {"id": 123}}})
         await self.settle()
         self.assertTrue(self.api.sent("sendMessage")[-1]["reply_markup"]["keyboard"][0][0]["request_location"])
         await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "cmd:reset", "message": {"message_id": 5, "chat": {"id": 123}}})

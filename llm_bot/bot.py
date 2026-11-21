@@ -49,11 +49,11 @@ TOOL_STATUS = {"set_reminder": "Ставлю напоминание…", "start_
 SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
 COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("reset", "Очистить контекст"),
-            ("settings", "Модель"), ("timezone", "Часовой пояс по геолокации"), ("info", "Все возможности бота"), ("help", "Справка")]
+            ("settings", "Модель и локация"), ("location", "Указать локацию"), ("info", "Все возможности бота"), ("help", "Справка")]
 # Shown in /settings; override with LLM_MODELS (comma-separated OpenRouter ids).
 DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"]
 INFO_KEYBOARD = {"inline_keyboard": [
-    [{"text": "⚙️ Модель", "callback_data": "cmd:settings"}, {"text": "📍 Часовой пояс", "callback_data": "cmd:timezone"}],
+    [{"text": "⚙️ Настройки", "callback_data": "cmd:settings"}, {"text": "📍 Локация", "callback_data": "cmd:location"}],
     [{"text": "📋 Мои задачи", "callback_data": "cmd:tasks"}, {"text": "💬 Новый диалог", "callback_data": "cmd:new"}]]}
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
                    "guest_message", "stopped_message_generation"]
@@ -298,20 +298,16 @@ class Bot:
                              "Пишите, присылайте фото, PDF или голосовые — ответ появляется по мере генерации, его можно остановить.\n"
                              "Могу напомнить («напомни завтра в 9 позвонить врачу») и следить за чем-то в фоне («следи за новостями о …»).\n"
                              "Исправьте своё сообщение — перепишу ответ.\n\n" + topics +
-                             "/tasks — напоминания и фоновые задачи.\n/reset — очистить контекст.\n/settings — модель.\n"
-                             "/timezone — часовой пояс: пришлите геолокацию.\n"
+                             "/tasks — напоминания и фоновые задачи.\n/reset — очистить контекст.\n/settings — модель и локация.\n"
+                             "/location — указать локацию (по ней ставлю часовой пояс).\n"
                              f"В любом чате: @{self.username} вопрос.\n\n/info — подробно обо всех возможностях.")
         elif command == "/info":
             await self.send_markdown(chat_id, thread_id, self.info_text(chat_id), None, INFO_KEYBOARD)
         elif command in ("/settings", "/model"):
             await self.api.call("sendMessage", text=self.settings_text(chat_id), reply_markup=self.settings_keyboard(chat_id),
                                 **self._target(chat_id, thread_id, None))
-        elif command == "/timezone":
-            keyboard = {"keyboard": [[{"text": "📍 Отправить геолокацию", "request_location": True}]],
-                        "resize_keyboard": True, "one_time_keyboard": True, "input_field_placeholder": "Геолокация задаст часовой пояс"}
-            await self.api.call("sendMessage", reply_markup=keyboard, **self._target(chat_id, thread_id, None),
-                                text=f"Сейчас: {self.zone_label(chat_id)}. Нажмите кнопку ниже или пришлите геолокацию "
-                                     "через 📎 → Геопозиция — по ней определю часовой пояс. Координаты не сохраняются.")
+        elif command in ("/location", "/timezone"):
+            await self.ask_location(chat_id, thread_id)
         elif command == "/tasks":
             text, markup = self.agent.list_markup(chat_id)
             await self.api.call("sendMessage", text=text, reply_markup=markup, **self._target(chat_id, thread_id, None))
@@ -518,7 +514,9 @@ class Bot:
                 else:
                     self.spawn(self.regenerate(turn))
                     toast = "Пишу заново…"
-            elif data.startswith("cmd:") and data[4:] in ("settings", "tasks", "timezone", "new"):
+            elif data.startswith("settings:"):
+                toast = await self.settings_action(query, data.removeprefix("settings:"))
+            elif data.startswith("cmd:") and data[4:] in ("settings", "tasks", "location", "new"):
                 chat_id = (query.get("message") or {}).get("chat", {}).get("id", user["id"])
                 self.spawn(self.on_command("/" + data[4:], "", chat_id, self.thread_of(query.get("message") or {})))
             elif data.startswith("ask:"):
@@ -537,10 +535,45 @@ class Bot:
         price = self.catalog.get(model, {}).get("price")
         return f" · ${price[0]:.2f}/${price[1]:.2f}" if price else ""
 
-    def settings_text(self, chat_id: int) -> str:
+    def settings_text(self, chat_id: int, view: str = "main") -> str:
         model = self.current_model(chat_id)
-        return (f"Модель: {model}{self.price(model)}\nЦена — $ за 1 млн токенов: ввод/вывод. Выбор действует во всех диалогах.\n\n"
-                f"Часовой пояс: {self.zone_label(chat_id)}. Чтобы изменить — пришлите геолокацию (📎 → Геопозиция) или /timezone.")
+        if view == "model":
+            return f"Выберите модель. Сейчас: {model}{self.price(model)}\nЦена — $ за 1 млн токенов: ввод/вывод."
+        place = self.location(chat_id)
+        where = (f"{place['latitude']:.4f}, {place['longitude']:.4f}" if place else "не указана")
+        return (f"⚙️ Настройки\n\nМодель: {model}{self.price(model)}\n"
+                f"Локация: {where}\nЧасовой пояс: {self.zone_label(chat_id)}")
+
+    def settings_keyboard(self, chat_id: int, view: str = "main") -> dict:
+        if view == "model":
+            current = self.current_model(chat_id)
+            rows = [[{"text": ("✓ " if model == current else "") + model.split("/")[-1] + self.price(model),
+                      "callback_data": f"model:{index}", **({"style": "primary"} if model == current else {})}]
+                    for index, model in enumerate(self.models)]
+            return {"inline_keyboard": rows + [[{"text": "← Назад", "callback_data": "settings:main"}]]}
+        return {"inline_keyboard": [[{"text": "🤖 Выбрать модель", "callback_data": "settings:model"}],
+                                    [{"text": "📍 Указать локацию", "callback_data": "settings:location"}]]}
+
+    async def settings_action(self, query: dict, action: str) -> str | None:
+        message = query.get("message") or {}
+        chat_id = message.get("chat", {}).get("id", query["from"]["id"])
+        if action in ("main", "model"):
+            await self.edit_settings(query, chat_id, action)
+        elif action == "location":
+            await self.ask_location(chat_id, self.thread_of(message))
+        return None
+
+    async def ask_location(self, chat_id: int, thread_id: int):
+        # Inline buttons cannot request a location; a one-time reply keyboard can.
+        keyboard = {"keyboard": [[{"text": "📍 Отправить геолокацию", "request_location": True}]],
+                    "resize_keyboard": True, "one_time_keyboard": True, "input_field_placeholder": "Отправьте геолокацию"}
+        await self.api.call("sendMessage", reply_markup=keyboard, **self._target(chat_id, thread_id, None),
+                            text="Нажмите кнопку ниже или пришлите геолокацию через 📎 → Геопозиция. "
+                                 "Сохраню её и по ней поставлю часовой пояс.")
+
+    def location(self, chat_id: int) -> dict | None:
+        """Saved location of the chat: latitude, longitude, timezone, updated_at."""
+        return self.store.get(f"location:{chat_id}")
 
     def info_text(self, chat_id: int) -> str:
         bot = f"@{self.username}" if self.username else "бот"
@@ -597,10 +630,10 @@ class Bot:
 </details>
 
 ## ⚙️ Настройки
-- `/settings` — выбор модели, цены за 1 млн токенов.
-- Часовой пояс — пришлите геолокацию (📎 → Геопозиция) или `/timezone`. Координаты не сохраняются.
+- `/settings` → **Выбрать модель**: цены за 1 млн токенов.
+- `/settings` → **Указать локацию**, или просто пришлите геолокацию (📎 → Геопозиция). Сохраню её и поставлю по ней часовой пояс; без локации — UTC.
 
-Команды: `/new` · `/tasks` · `/reset` · `/settings` · `/timezone` · `/info` · `/help`
+Команды: `/new` · `/tasks` · `/reset` · `/settings` · `/location` · `/info` · `/help`
 """
 
     def zone_label(self, chat_id: int) -> str:
@@ -615,18 +648,13 @@ class Bot:
         except (KeyError, TypeError, ValueError):
             return
         name, exact = await geo.timezone_at(getattr(self.api, "client", None), lat, lon)
+        self.store.set(f"location:{chat_id}", {"latitude": lat, "longitude": lon, "timezone": name, "updated_at": int(time.time())})
         self.store.set(f"timezone:{chat_id}", name)
-        log.info("chat %s time zone set to %s (exact=%s)", chat_id, name, exact)
+        log.info("chat %s location saved, time zone %s (exact=%s)", chat_id, name, exact)
         note = "" if exact else " Точный пояс определить не удалось — взял по долготе."
         await self.react(chat_id, message_id, "👌")
-        await self.api.call("sendMessage", text=f"Часовой пояс: {self.zone_label(chat_id)}.{note}",
+        await self.api.call("sendMessage", text=f"📍 Локация сохранена. Часовой пояс: {self.zone_label(chat_id)}.{note}",
                             reply_markup={"remove_keyboard": True}, **self._target(chat_id, thread_id, message_id))
-
-    def settings_keyboard(self, chat_id: int) -> dict:
-        current = self.current_model(chat_id)
-        return {"inline_keyboard": [[{"text": ("✓ " if model == current else "") + model.split("/")[-1] + self.price(model),
-                                      "callback_data": f"model:{index}", **({"style": "primary"} if model == current else {})}]
-                                    for index, model in enumerate(self.models)]}
 
     async def choose_model(self, query: dict, data: str) -> str:
         try:
@@ -636,15 +664,15 @@ class Bot:
         chat_id = (query.get("message") or {}).get("chat", {}).get("id", query["from"]["id"])
         self.store.set(f"model:{chat_id}", model)
         log.info("chat %s switched model to %s", chat_id, model)
-        await self.edit_settings(query, chat_id)
+        await self.edit_settings(query, chat_id, "main")
         return "Модель: " + model.split("/")[-1]
 
-    async def edit_settings(self, query: dict, chat_id: int):
+    async def edit_settings(self, query: dict, chat_id: int, view: str = "main"):
         message = query.get("message") or {}
         if message.get("message_id"):
             try:
                 await self.api.call("editMessageText", chat_id=chat_id, message_id=message["message_id"],
-                                    text=self.settings_text(chat_id), reply_markup=self.settings_keyboard(chat_id))
+                                    text=self.settings_text(chat_id, view), reply_markup=self.settings_keyboard(chat_id, view))
             except TelegramError as exc:
                 if "not modified" not in exc.description:
                     log.warning("settings edit failed: %s", exc.description)
