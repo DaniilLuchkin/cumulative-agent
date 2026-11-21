@@ -49,9 +49,12 @@ TOOL_STATUS = {"set_reminder": "Ставлю напоминание…", "start_
 SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
 COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("reset", "Очистить контекст"),
-            ("settings", "Модель"), ("timezone", "Часовой пояс по геолокации"), ("help", "Справка")]
+            ("settings", "Модель"), ("timezone", "Часовой пояс по геолокации"), ("info", "Все возможности бота"), ("help", "Справка")]
 # Shown in /settings; override with LLM_MODELS (comma-separated OpenRouter ids).
 DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"]
+INFO_KEYBOARD = {"inline_keyboard": [
+    [{"text": "⚙️ Модель", "callback_data": "cmd:settings"}, {"text": "📍 Часовой пояс", "callback_data": "cmd:timezone"}],
+    [{"text": "📋 Мои задачи", "callback_data": "cmd:tasks"}, {"text": "💬 Новый диалог", "callback_data": "cmd:new"}]]}
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
                    "guest_message", "stopped_message_generation"]
 
@@ -297,7 +300,9 @@ class Bot:
                              "Исправьте своё сообщение — перепишу ответ.\n\n" + topics +
                              "/tasks — напоминания и фоновые задачи.\n/reset — очистить контекст.\n/settings — модель.\n"
                              "/timezone — часовой пояс: пришлите геолокацию.\n"
-                             f"В любом чате: @{self.username} вопрос.")
+                             f"В любом чате: @{self.username} вопрос.\n\n/info — подробно обо всех возможностях.")
+        elif command == "/info":
+            await self.send_markdown(chat_id, thread_id, self.info_text(chat_id), None, INFO_KEYBOARD)
         elif command in ("/settings", "/model"):
             await self.api.call("sendMessage", text=self.settings_text(chat_id), reply_markup=self.settings_keyboard(chat_id),
                                 **self._target(chat_id, thread_id, None))
@@ -513,6 +518,9 @@ class Bot:
                 else:
                     self.spawn(self.regenerate(turn))
                     toast = "Пишу заново…"
+            elif data.startswith("cmd:") and data[4:] in ("settings", "tasks", "timezone", "new"):
+                chat_id = (query.get("message") or {}).get("chat", {}).get("id", user["id"])
+                self.spawn(self.on_command("/" + data[4:], "", chat_id, self.thread_of(query.get("message") or {})))
             elif data.startswith("ask:"):
                 row = self.store.one("SELECT * FROM suggestions WHERE id=?", (int(data[4:]),)) if data[4:].isdigit() else None
                 if row:
@@ -533,6 +541,67 @@ class Bot:
         model = self.current_model(chat_id)
         return (f"Модель: {model}{self.price(model)}\nЦена — $ за 1 млн токенов: ввод/вывод. Выбор действует во всех диалогах.\n\n"
                 f"Часовой пояс: {self.zone_label(chat_id)}. Чтобы изменить — пришлите геолокацию (📎 → Геопозиция) или /timezone.")
+
+    def info_text(self, chat_id: int) -> str:
+        bot = f"@{self.username}" if self.username else "бот"
+        topics = ("`/new` открывает новый топик; топик можно создать и самому — название придумаю после первого ответа."
+                  if self.topics_enabled else
+                  "Сейчас режим топиков выключен — `/new` просто очищает контекст. Включается в @BotFather.")
+        return f"""# Что умеет бот
+
+Сейчас: модель **{self.current_model(chat_id).split("/")[-1]}**, часовой пояс **{self.zone_label(chat_id)}**.
+
+## 💬 Разговор
+- Ответ печатается по мере генерации; кнопка **Стоп** под черновиком прерывает его, написанное сохранится.
+- 👀 на вашем сообщении — взял в работу.
+- Под ответом — вопросы для продолжения и **🔄 Перегенерировать**.
+- Исправьте своё последнее сообщение — перепишу ответ.
+- Ищу в интернете, когда нужны свежие данные, и даю ссылки на источники.
+
+<details><summary>Диалоги и контекст</summary>
+
+- У каждого топика своя история. {topics}
+- `/reset` — забыть историю текущего диалога.
+- Помню последние сообщения диалога; старые постепенно выпадают из контекста.
+</details>
+
+## 📎 Файлы и голос
+| Что прислать | Что сделаю |
+|:--|:--|
+| Фото или картинку | Опишу, прочитаю текст, отвечу на вопрос в подписи |
+| PDF | Перескажу или найду нужное |
+| Текстовый файл, код, CSV | Разберу, проверю, объясню |
+| Голосовое | Распознаю и отвечу; расшифровку покажу цитатой |
+
+## ⏰ Напоминания
+Просто попросите: «напомни завтра в 9 позвонить врачу», «каждый будний день в 8:30 — зарядка».
+- 🫡 на сообщении — напоминание поставлено.
+- В срок напишу сам; кнопки **+15 мин**, **+1 час**, **Завтра** откладывают.
+- Повторы: каждый день, по будням, каждую неделю.
+
+## 👁 Фоновые задачи
+«Следи за новостями о DeepSeek раз в 6 часов», «проверяй цену на билеты до Казани каждый день».
+- Для задачи создаётся отдельный топик с закреплённым статусом и кнопками **Проверить сейчас** и **Остановить**.
+- Пишу только когда появилось что-то новое.
+- До 10 задач, проверка не чаще раза в час.
+
+`/tasks` — все напоминания и задачи с кнопками отмены.
+
+## 🌍 В других чатах
+- `{bot} вопрос` в поле ввода любого чата — ответ появится прямо в отправленном сообщении.
+- Упомяните {bot} в группе, даже если меня там нет, — отвечу; если ответить так на сообщение, учту его.
+
+<details><summary>Если не работает</summary>
+
+Владелец бота должен включить в @BotFather: inline mode (`/setinline`), inline feedback (`/setinlinefeedback`) и Guest Mode.
+</details>
+
+## ⚙️ Настройки
+- `/settings` — выбор модели, цены за 1 млн токенов.
+- Часовой пояс — пришлите геолокацию (📎 → Геопозиция) или `/timezone`. Координаты не сохраняются.
+
+Команды: `/new` · `/tasks` · `/reset` · `/settings` · `/timezone` · `/info` · `/help`
+"""
 
     def zone_label(self, chat_id: int) -> str:
         zone = self.zone(chat_id)

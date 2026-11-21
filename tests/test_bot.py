@@ -120,7 +120,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_and_topics_detected(self):
         self.assertTrue(self.bot.topics_enabled)
         commands = self.api.sent("setMyCommands")[0]
-        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "reset", "settings", "timezone", "help"])
+        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "reset", "settings", "timezone", "info", "help"])
 
     async def test_streams_thinking_then_drafts_then_rich_answer_with_reactions(self):
         await self.bot.on_message(message("Как дела?"))
@@ -414,6 +414,23 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await geo.timezone_at(client, 55.7, 37.6), ("Etc/GMT-3", False))
         self.assertEqual(geo.by_longitude(-74), "Etc/GMT+5")
         self.assertEqual(geo.by_longitude(1), "UTC")
+
+    async def test_info_is_a_rich_guide_with_working_buttons(self):
+        await self.bot.on_message(message("/info"))
+        sent = self.api.sent("sendRichMessage")[-1]
+        text = sent["rich_message"]["markdown"]
+        self.assertTrue(text.startswith("# Что умеет бот"))
+        for section in ("## 💬 Разговор", "## 📎 Файлы и голос", "## ⏰ Напоминания", "## 👁 Фоновые задачи", "## 🌍 В других чатах", "<details>", "@test_bot"):
+            self.assertIn(section, text)
+        self.assertIn("часовой пояс **UTC**", text)
+        self.assertEqual(self.llm.requests, [])
+        buttons = [b["callback_data"] for row in sent["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertEqual(buttons, ["cmd:settings", "cmd:timezone", "cmd:tasks", "cmd:new"])
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "cmd:timezone", "message": {"message_id": 5, "chat": {"id": 123}}})
+        await self.settle()
+        self.assertTrue(self.api.sent("sendMessage")[-1]["reply_markup"]["keyboard"][0][0]["request_location"])
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "cmd:reset", "message": {"message_id": 5, "chat": {"id": 123}}})
+        self.assertEqual(len(self.api.sent("sendMessage")), 1)  # only whitelisted commands run from buttons
 
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])

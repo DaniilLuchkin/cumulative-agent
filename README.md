@@ -20,6 +20,7 @@ LLM-агент для Telegram, собранный из возможностей
 | Отдельные диалоги в топиках, названия ставит модель | `createForumTopic`, `editForumTopic`, `forum_topic_created.is_name_implicit` |
 | `@бот вопрос` в любом чате | Inline mode: `answerInlineQuery` → `chosen_inline_result` → ответ дописывается в сообщение через `editMessageText(inline_message_id)` |
 | Упоминание `@бот` в чате, где бота нет (с контекстом сообщения, на которое ответили) | Guest Mode: update `guest_message` → `answerGuestQuery` → правка `inline_message_id` |
+| `/info` — справочник по всем возможностям: разделы, таблица форматов, сворачиваемые блоки и кнопки «Модель / Часовой пояс / Мои задачи / Новый диалог» | `sendRichMessage` (Rich Markdown, `<details>`), inline-клавиатура |
 | `/settings` — модель с ценой (DeepSeek V4.1 Flash или GPT-6.2 Sol) | inline-клавиатура, `editMessageText` |
 | Часовой пояс — по умолчанию UTC; пришлите геолокацию (или `/timezone` → кнопка «📍 Отправить геолокацию») | `KeyboardButton.request_location`; пояс по координатам, округлённым до ~10 км, определяет open-meteo.com (без ключа), координаты не хранятся; при ошибке — по долготе |
 
