@@ -3,17 +3,32 @@
 #   curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/deploy/install.sh | sudo bash
 # Re-running updates the code and keeps /etc/llm-bot.env and the conversation history.
 # Keys are taken from an existing /etc/cumulative-agent.env when present.
+# The timer llm-bot-update runs this script with AUTO_UPDATE=1 every 5 minutes: it deploys
+# new commits of the branch after the tests pass and rolls back if the bot does not start.
 set -euo pipefail
 ref=${BOT_REF:-Alt}
 repo=${REPO_URL:-https://github.com/DaniilLuchkin/cumulative-agent.git}
 app=/opt/llm-bot
 env_file=/etc/llm-bot.env
+auto=${AUTO_UPDATE:-0}
 [[ ${EUID} -eq 0 ]] || { echo "Run with sudo" >&2; exit 1; }
 
-apt-get install -y -qq python3 python3-venv git ca-certificates >/dev/null
+if [[ ${auto} == 1 ]]; then
+    [[ -f ${env_file} ]] || { echo "Not installed yet" >&2; exit 1; }
+    remote=$(git ls-remote "${repo}" "refs/heads/${ref}" | cut -f1)
+    [[ -n ${remote} ]] || { echo "Cannot read ${ref} from ${repo}" >&2; exit 1; }
+    # Skip the running commit and a commit that already failed tests or startup.
+    [[ ${remote} == "$(cat "${app}/COMMIT" 2>/dev/null)" || ${remote} == "$(cat "${app}/FAILED" 2>/dev/null)" ]] && exit 0
+    echo "New commit ${remote:0:7} on ${ref}"
+fi
+
+if ! command -v git >/dev/null || ! python3 -c "import ensurepip" 2>/dev/null; then
+    apt-get install -y -qq python3 python3-venv git ca-certificates >/dev/null
+fi
 work=$(mktemp -d)
 trap 'rm -rf "${work}"' EXIT
 git clone --quiet --depth 1 --branch "${ref}" "${repo}" "${work}/src"
+commit=$(git -C "${work}/src" rev-parse HEAD)
 
 old_env=/etc/cumulative-agent.env
 old_db=/var/lib/cumulative-agent/agent.sqlite3
@@ -64,15 +79,63 @@ if systemctl is-enabled --quiet cumulative-agent 2>/dev/null || systemctl is-act
 fi
 
 install -d -m 755 "${app}"
+[[ -x ${app}/.venv/bin/python ]] || python3 -m venv "${app}/.venv"
+pip=("${app}/.venv/bin/pip" install --quiet --disable-pip-version-check)
+
+# Test the new release before it replaces the running one.
+"${pip[@]}" "${work}/src"
+if ! (cd "${work}/src" && "${app}/.venv/bin/python" -m unittest discover -s tests >/dev/null 2>"${work}/tests.log"); then
+    tail -n 20 "${work}/tests.log" >&2
+    echo "Tests failed for ${commit:0:7}; the running version is kept." >&2
+    echo "${commit}" > "${app}/FAILED"
+    [[ -d ${app}/llm_bot ]] && "${pip[@]}" --no-deps --force-reinstall "${app}"
+    exit 1
+fi
+
+# Keep the current release for rollback, then switch.
+rm -rf "${app}/previous"
+if [[ -d ${app}/llm_bot ]]; then
+    mkdir "${app}/previous"
+    cp -r "${app}/llm_bot" "${app}/pyproject.toml" "${app}/previous/"
+    cp "${app}/COMMIT" "${app}/previous/" 2>/dev/null || true
+fi
 rm -rf "${app}/llm_bot" "${app}/build"
 cp -r "${work}/src/llm_bot" "${work}/src/pyproject.toml" "${app}/"
-[[ -x ${app}/.venv/bin/python ]] || python3 -m venv "${app}/.venv"
-"${app}/.venv/bin/pip" install --quiet --disable-pip-version-check --upgrade "${app}"
+"${pip[@]}" --no-deps --force-reinstall "${app}"
+echo "${commit}" > "${app}/COMMIT"
+# install creates a new file, so a running copy of this script is not overwritten in place.
+install -m 755 "${work}/src/deploy/install.sh" "${app}/install.sh"
 chmod -R u=rwX,go=rX "${app}"
-install -m 644 "${work}/src/deploy/llm-bot.service" /etc/systemd/system/llm-bot.service
+for unit in llm-bot.service llm-bot-update.service llm-bot-update.timer; do
+    install -m 644 "${work}/src/deploy/${unit}" "/etc/systemd/system/${unit}"
+done
 systemctl daemon-reload
 systemctl enable --quiet llm-bot
+systemctl enable --quiet --now llm-bot-update.timer
+
+started() {
+    local since=$1
+    for _ in $(seq ${START_WAIT:-30}); do
+        sleep 1
+        journalctl -u llm-bot --since "@${since}" --no-pager -q | grep -q "started as @" && return 0
+    done
+    return 1
+}
+since=$(date +%s)
 systemctl restart llm-bot
-sleep 4
-journalctl -u llm-bot -n 5 --no-pager || true
-echo "Installed $(git -C "${work}/src" rev-parse --short HEAD). Logs: journalctl -u llm-bot -f"
+if ! started "${since}"; then
+    journalctl -u llm-bot --since "@${since}" -n 20 --no-pager >&2 || true
+    if [[ -d ${app}/previous ]]; then
+        echo "The bot did not start on ${commit:0:7}; rolling back." >&2
+        rm -rf "${app}/llm_bot" "${app}/build"
+        cp -r "${app}/previous/llm_bot" "${app}/previous/pyproject.toml" "${app}/"
+        cp "${app}/previous/COMMIT" "${app}/COMMIT" 2>/dev/null || rm -f "${app}/COMMIT"
+        "${pip[@]}" --no-deps --force-reinstall "${app}"
+        systemctl restart llm-bot
+    fi
+    echo "${commit}" > "${app}/FAILED"
+    exit 1
+fi
+rm -f "${app}/FAILED"
+journalctl -u llm-bot --since "@${since}" -n 5 --no-pager || true
+echo "Installed ${commit:0:7}. Logs: journalctl -u llm-bot -f; updates: journalctl -u llm-bot-update"

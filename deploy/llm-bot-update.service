@@ -1,0 +1,10 @@
+[Unit]
+Description=Deploy new commits of the Telegram LLM bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=AUTO_UPDATE=1
+ExecStart=/opt/llm-bot/install.sh
+TimeoutStartSec=600

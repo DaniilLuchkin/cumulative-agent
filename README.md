@@ -51,6 +51,23 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 | `HISTORY_CHARS` | 24000 | |
 | `BOT_DB` | `data/bot.sqlite3` | |
 
+## Автодеплой
+
+Установщик ставит таймер `llm-bot-update`: раз в 5 минут сервер проверяет ветку `Alt`
+(`git ls-remote`). Если появился новый коммит, установщик:
+
+1. собирает новую версию и прогоняет тесты; если тесты не прошли, работающая версия остаётся;
+2. переключает бота, сохранив предыдущую версию в `/opt/llm-bot/previous`;
+3. ждёт в логе строку `started as @…` до 30 с; если её нет, возвращает предыдущую версию.
+
+Коммит, который не прошёл тесты или не запустился, помечается в `/opt/llm-bot/FAILED` и
+повторно не ставится — исправление выкатится следующим коммитом. Входящие подключения
+к серверу и секреты в GitHub не нужны.
+
+* История обновлений: `journalctl -u llm-bot-update`.
+* Обновить сразу: `sudo systemctl start llm-bot-update`.
+* Отключить: `sudo systemctl disable --now llm-bot-update.timer`.
+
 ## Локально
 
 ```bash
