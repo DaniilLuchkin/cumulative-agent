@@ -588,7 +588,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_message(message("Нарисуй"))
         self.assertFalse(self.api.sent("sendWidget"))
         self.assertIn("Too large", self.llm.requests[2][-1]["content"])
-        self.assertIn("size limit", self.llm.requests[-1][-1]["content"])
+        self.assertIn("does not fit Telegram", self.llm.requests[-1][-1]["content"])
 
     async def test_quiz_and_poll(self):
         self.llm.script = [Result(tool_calls=[call("create_poll", question="Столица Австралии?", options=["Сидней", "Канберра", "Мельбурн"],
