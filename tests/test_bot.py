@@ -50,6 +50,10 @@ class FakeApi:
 
 
 def call(name, **args):
+    return call_tool(name, **args)
+
+
+def call_tool(name, **args):
     return {"id": "call_" + name, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
 
 
@@ -559,10 +563,28 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(LLMError, "лимит токенов"):
                 await OpenRouter("k", "m", client).run([], max_tokens=100)
 
+    async def test_widget_rejected_by_telegram_is_rewritten_once(self):
+        original = self.api.call
+        attempts = []
+
+        async def call(method, http_timeout=30, **params):
+            if method == "sendWidget":
+                attempts.append(params)
+                if len(attempts) == 1:
+                    raise TelegramError(method, "Bad Request: INPUT_MEDIA_WIDGET_HTML_INVALID")
+            return await original(method, http_timeout, **params)
+        self.api.call = call
+        self.llm.script = [Result(tool_calls=[call_tool("show_widget", description="карта", caption="Кофейни")]),
+                           ("<p>v1</p>",), ("<p>v2</p>",), ("Готово",)]
+        await self.bot.on_message(message("Карта кофеен"))
+        self.assertEqual([a["html"] for a in attempts], ["<p>v1</p>", "<p>v2</p>"])
+        self.assertIsNone(attempts[0]["allow_queries"])  # the real Api drops None fields
+        self.assertIn("INPUT_MEDIA_WIDGET_HTML_INVALID", self.llm.requests[2][-1]["content"])
+
     async def test_oversized_widget_is_rewritten_then_rejected(self):
         import os
         big = os.urandom(6000).hex()  # incompressible
-        self.llm.script = [Result(tool_calls=[call("show_widget", description="x", caption="X")]), (big,), (big,), (big,), ("Не получилось.",)]
+        self.llm.script = [Result(tool_calls=[call("show_widget", description="x", caption="X")]), (big,), (big,), (big,), (big,), ("Не получилось.",)]
         await self.bot.on_message(message("Нарисуй"))
         self.assertFalse(self.api.sent("sendWidget"))
         self.assertIn("Too large", self.llm.requests[2][-1]["content"])
@@ -711,6 +733,19 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])
         self.assertEqual(split("x" * 90, 40), ["x" * 40, "x" * 40, "x" * 10])
+
+
+class TelegramApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_none_fields_are_not_sent(self):
+        from llm_bot.telegram import Api
+        bodies = []
+
+        def handler(request):
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await Api("1:x", client).call("sendWidget", chat_id=1, html="<p>x</p>", caption=None, allow_queries=None)
+        self.assertEqual(bodies[0], {"chat_id": 1, "html": "<p>x</p>"})
 
 
 class OpenRouterTests(unittest.IsolatedAsyncioTestCase):

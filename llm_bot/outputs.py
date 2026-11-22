@@ -141,18 +141,27 @@ class Outputs:
         messages = [{"role": "system", "content": WIDGET_RULES + "\n" + WIDGET_PROTOCOL}, {"role": "user", "content": request}]
         models = [self.bot.current_model(ctx["chat_id"])]
         models += [m for m in self.bot.models if m not in models and m != "openrouter/auto"][:1]
-        html = ""
-        for _ in range(3):
-            html = strip_fences(await self.author(messages, models))
+        html, sent = "", None
+        for attempt in range(4):
+            html = strip_fences(await self.author(messages, models)).replace("\x00", "")
             size, packed = len(html.encode("utf-8")), compressed_size(html)
-            if html and size <= MAX_HTML and packed <= MAX_COMPRESSED:
-                break
+            if not html or size > MAX_HTML or packed > MAX_COMPRESSED:
+                problem = f"Too large: {size} bytes, {packed} bytes compressed (limits {MAX_HTML} and {MAX_COMPRESSED})."
+            else:
+                try:
+                    sent = await self.bot.api.call("sendWidget", html=html, caption=caption[:1024] or None,
+                                                   allow_queries=ask_bot or None, **self.target(ctx))
+                    break
+                except TelegramError as exc:
+                    log.warning("sendWidget rejected: %s (html %s bytes, %s compressed)", exc.description, size, packed)
+                    if "WIDGET" not in exc.description.upper() or attempt == 3:
+                        raise
+                    problem = f"Telegram rejected the widget: {exc.description}."
             messages += [{"role": "assistant", "content": html},
-                         {"role": "user", "content": f"Too large: {size} bytes, {packed} bytes compressed (limits {MAX_HTML} and {MAX_COMPRESSED}). "
-                                                     "Rewrite it smaller: drop decoration and repetition, keep the function. HTML only."}]
+                         {"role": "user", "content": problem + " Rewrite it smaller and simpler, within the widget profile: "
+                                                               "drop decoration and repetition, keep the function. HTML only."}]
         else:
-            raise ValueError("the widget does not fit Telegram's size limit")
-        sent = await self.bot.api.call("sendWidget", html=html, caption=caption[:1024] or None, allow_queries=ask_bot, **self.target(ctx))
+            raise ValueError("the widget does not fit Telegram's limits")
         message_id = sent.get("message_id") if isinstance(sent, dict) else None
         if message_id:
             self.bot.store.run("INSERT INTO widgets(chat_id,thread_id,message_id,caption) VALUES(?,?,?,?)",

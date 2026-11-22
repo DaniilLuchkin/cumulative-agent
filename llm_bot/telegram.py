@@ -37,6 +37,7 @@ class Api:
         return result["result"]
 
     async def call(self, method: str, http_timeout: float = 30, **params):
+        params = {k: v for k, v in params.items() if v is not None}  # optional fields are omitted, never null
         try:
             response = await self.client.post(self.base + method, json=params, timeout=http_timeout)
             data = response.json()
