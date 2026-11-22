@@ -2,7 +2,7 @@
 import base64
 from dataclasses import dataclass, field
 
-from .llm import LLMError
+from .llm import LLMError, purpose_var
 
 MAX_FILE = 20 * 1024 * 1024  # getFile downloads up to 20 MB
 TEXT_TYPES = ("text/", "application/json", "application/xml", "application/x-yaml", "application/javascript")
@@ -40,7 +40,11 @@ async def read(bot, message: dict) -> Input | None:
         audio = message.get("voice") or message["audio"]
         fmt = AUDIO_FORMATS.get(audio.get("mime_type", "audio/ogg"), "ogg")
         data = await download(bot, audio["file_id"], audio.get("file_size"))
-        transcript = await bot.llm.transcribe(data, fmt, bot.config.transcribe_model)
+        token = purpose_var.set("voice")
+        try:
+            transcript = await bot.llm.transcribe(data, fmt, bot.config.transcribe_model)
+        finally:
+            purpose_var.reset(token)
         text = (caption + "\n\n" + transcript).strip() if caption else transcript
         return Input(text=text, transcript=transcript)
     if message.get("document"):

@@ -22,9 +22,10 @@ from html import escape
 from zoneinfo import ZoneInfo
 
 from . import geo, media, outputs
+from .memory import FUNCTION as SEARCH_HISTORY, Memory
 from .agent import Agent
 from .inline import Surfaces
-from .llm import FILE_PLUGIN, LLMError
+from .llm import FILE_PLUGIN, SERVER_TOOLS, LLMError, chat_var, purpose_var
 from .store import Store
 from .telegram import Api, TelegramError
 
@@ -43,7 +44,11 @@ DEFAULT_PROMPT = ("You are a helpful personal assistant in a Telegram chat. Repl
                   "![](https://... \"caption\"), several images in <tg-collage> or <tg-slideshow>.\n"
                   "Tools: set reminders and background watches; search the web for current facts; show_widget for interactive or visual "
                   "content (calculators, charts, timers, flashcards, mini-games); create_poll for polls and quizzes; generate_image for "
-                  "pictures; send_file for downloadable text files (CSV, JSON, .ics, code); answer_with_voice when asked to speak. "
+                  "pictures; send_file for downloadable text files (CSV, JSON, .ics, code); answer_with_voice when asked to speak; "
+                  "search_history to recall earlier conversations from any topic. If available: the advisor tool consults a stronger "
+                  "model on hard questions (tricky math, code, important decisions) before you answer; the subagent tool delegates "
+                  "self-contained subtasks (summaries, extraction, research) to a cheaper worker; the fusion tool is an expensive "
+                  "multi-model panel: use it only when the user explicitly asks for several opinions or a model comparison. "
                   "Pick a tool only when it serves the user better than plain text.")
 CONTEXT_PROMPT = "Current local time of the user: {now} ({zone})."
 UNKNOWN_ZONE_PROMPT = ("The user's time zone is not set, UTC is assumed. When times of day matter (reminders, schedules), "
@@ -52,17 +57,21 @@ TITLE_PROMPT = ("Name this conversation in 2-5 words in the language of the user
                 "Reply with the title only, no quotes or trailing period.")
 SUGGEST_PROMPT = ("Suggest 3 short follow-up questions the user may ask next, in the user's language, each under 40 characters. "
                   "Reply with a JSON array of strings only.")
-TOOL_STATUS = {"set_reminder": "Ставлю напоминание…", "start_watch": "Запускаю фоновую задачу…",
+TOOL_STATUS = {"search_history": "Вспоминаю…", "set_reminder": "Ставлю напоминание…", "start_watch": "Запускаю фоновую задачу…",
                "list_scheduled": "Смотрю расписание…", "cancel_scheduled": "Отменяю…", **outputs.STATUS}
 SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
-COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("reset", "Очистить контекст"),
+COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("usage", "Расходы на модели"), ("reset", "Очистить контекст"),
             ("settings", "Модель, часовой пояс и локация"), ("location", "Часовой пояс и локация"), ("info", "Все возможности бота"), ("help", "Справка")]
 # Shown in /settings; override with LLM_MODELS (comma-separated OpenRouter ids).
 DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"]
+DEFAULT_FUSION = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol", "google/gemini-4-hydrogen"]
 INFO_KEYBOARD = {"inline_keyboard": [
     [{"text": "⚙️ Настройки", "callback_data": "cmd:settings"}, {"text": "📍 Локация", "callback_data": "cmd:location"}],
     [{"text": "📋 Мои задачи", "callback_data": "cmd:tasks"}, {"text": "💬 Новый диалог", "callback_data": "cmd:new"}]]}
+REASONING = {"auto": "авто", "low": "быстро", "high": "глубоко"}
+PURPOSES = {"chat": "Ответы", "utility": "Подсказки и названия", "widget": "Виджеты", "image": "Картинки", "voice": "Голос",
+            "memory": "Поиск по истории", "watch": "Фоновые задачи", "inline": "Inline и Guest"}
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
                    "guest_message", "widget_query", "stopped_message_generation"]
 
@@ -76,6 +85,12 @@ class Config:
     utility_model: str = "deepseek/deepseek-v4.1-flash"     # titles and follow-up suggestions
     transcribe_model: str = "openai/whisper-large-v3-turbo"
     image_model: str = "openai/gpt-image-2.6-flare"
+    advisor_model: str = "openai/gpt-6.2-sol"            # consulted by cheaper models on hard questions; "" turns it off
+    worker_model: str = "deepseek/deepseek-v4.1-flash"   # takes delegated subtasks from stronger models; "" turns it off
+    fusion_models: list[str] = field(default_factory=lambda: list(DEFAULT_FUSION))  # FUSION_MODELS= turns it off
+    embedding_model: str = "openai/text-embedding-3-small"
+    fallbacks: bool = True                               # try the other listed models when the chosen one fails
+    tts_price_per_char: float = 15e-6                    # the speech endpoint returns no usage; estimate for /usage
     tts_model: str = "microsoft/mai-voice-2.1-flash"
     tts_voice_ru: str = "ru-RU-Lev:MAI-Voice-2.1-Flash"
     tts_voice_en: str = "en-US-Grant:MAI-Voice-2.1-Flash"
@@ -101,6 +116,10 @@ class Config:
         return cls(telegram_token=env("TELEGRAM_BOT_TOKEN"), openrouter_key=env("OPENROUTER_API_KEY"),
                    model=env("LLM_MODEL") or cls.model, models=models, utility_model=env("UTILITY_MODEL") or cls.utility_model,
                    transcribe_model=env("TRANSCRIBE_MODEL") or cls.transcribe_model, image_model=env("IMAGE_MODEL") or cls.image_model,
+                   advisor_model=env("ADVISOR_MODEL", cls.advisor_model), worker_model=env("WORKER_MODEL", cls.worker_model),
+                   fusion_models=[m for m in env("FUSION_MODELS", ",".join(DEFAULT_FUSION)).replace(" ", "").split(",") if m],
+                   embedding_model=env("EMBEDDING_MODEL") or cls.embedding_model,
+                   fallbacks=env("FALLBACKS", "on").lower() not in ("0", "off", "false", "no"),
                    tts_model=env("TTS_MODEL") or cls.tts_model, tts_voice_ru=env("TTS_VOICE_RU") or cls.tts_voice_ru,
                    tts_voice_en=env("TTS_VOICE_EN") or cls.tts_voice_en, timezone=env("TIMEZONE") or cls.timezone,
                    system_prompt=env("SYSTEM_PROMPT") or DEFAULT_PROMPT, allowed_ids=ids, database=env("BOT_DB", cls.database),
@@ -162,7 +181,9 @@ class Bot:
         self.tasks: set[asyncio.Task] = set()
         self.catalog: dict[str, dict] = {}
         self.models = list(dict.fromkeys([config.model, *config.models]))  # the configured default is always selectable
-        self.agent, self.surfaces, self.outputs = Agent(self), Surfaces(self), outputs.Outputs(self)
+        self.agent, self.surfaces, self.outputs, self.memory = Agent(self), Surfaces(self), outputs.Outputs(self), Memory(self)
+        if hasattr(llm, "usage_sink"):
+            llm.usage_sink = self.record_usage
 
     # --- setup, polling, scheduler -------------------------------------------------
 
@@ -191,6 +212,7 @@ class Bot:
                 log.error("Telegram setup failed: %s", exc.description)
                 await asyncio.sleep(exc.retry_after or 10)
         self.spawn(self.scheduler())
+        self.spawn(self.memory.index())  # embeds the backlog once, then only new messages
         offset = self.store.get("offset", 0)
         while True:
             try:
@@ -324,6 +346,8 @@ class Bot:
                                 **self._target(chat_id, thread_id, None))
         elif command in ("/location", "/timezone"):
             await self.ask_location(chat_id, thread_id)
+        elif command == "/usage":
+            await self.send_markdown(chat_id, thread_id, await self.usage_text(), None)
         elif command == "/tasks":
             text, markup = self.agent.list_markup(chat_id)
             await self.api.call("sendMessage", text=text, reply_markup=markup, **self._target(chat_id, thread_id, None))
@@ -392,6 +416,8 @@ class Bot:
                 self.busy.discard(key)
 
     async def _answer(self, chat_id, thread_id, content, message_id, prefix, user_row):
+        chat_var.set(chat_id)
+        purpose_var.set("chat")
         await self.react(chat_id, message_id, "👀")
         if user_row is None:
             user_row = self.store.add(chat_id, thread_id, "user", content.text)
@@ -404,7 +430,7 @@ class Bot:
         stop_key = (chat_id, draft_id)
         draft = Draft(self, chat_id, thread_id, draft_id)
         ctx = {"chat_id": chat_id, "thread_id": thread_id, "zone": self.zone(chat_id), "reaction": None,
-               "voice": bool(content.transcript), "artifacts": []}
+               "voice": bool(content.transcript), "artifacts": [], "reasoning": ""}
         pusher = asyncio.create_task(draft.run())
         generation = asyncio.create_task(self.generate(messages, draft, self.model_for(chat_id, content.needs), ctx, content.pdf))
         self.generations[stop_key] = generation
@@ -436,20 +462,34 @@ class Bot:
         reply_to = message_id
         if ctx["voice"] and not stopped and await self.outputs.send_voice(chat_id, thread_id, result, message_id):
             reply_to = None  # the voice message replies; the text below is its transcript
-        sent = await self.send_markdown(chat_id, thread_id, prefix + result, reply_to, self.answer_keyboard(turn, []))
+        shown = prefix + result
+        if ctx["reasoning"] and self.reasoning_level(chat_id) == "high":
+            thoughts = ctx["reasoning"].strip()[:3000].replace("</details>", "")
+            shown += f"\n\n<details><summary>🧠 Ход рассуждений</summary>\n\n{thoughts}\n</details>"
+        sent = await self.send_markdown(chat_id, thread_id, shown, reply_to, self.answer_keyboard(turn, []))
         self.store.run("UPDATE turns SET bot_message_ids=? WHERE id=?", (json.dumps(sent), turn))
         await self.react(chat_id, message_id, ctx["reaction"])
         await self.autoname(chat_id, thread_id)
         if self.config.suggestions and result and not stopped and sent:
             self.spawn(self.suggest(chat_id, thread_id, turn, sent[-1], content.text, result))
+        self.spawn(self.memory.index(50))
 
     async def generate(self, messages: list[dict], draft: Draft, model: str, ctx: dict, pdf: bool = False):
         """Agent loop: stream the model, run requested tools, feed results back."""
         def on_text(text: str):
             draft.text, draft.status = text, ""
 
+        def on_reasoning(_: str):
+            if not draft.text:
+                draft.status = "Размышляю…"
+
+        level = self.reasoning_level(ctx["chat_id"])
+        reasoning = {"low": {"effort": "low"}, "high": {"effort": "high"}}.get(level)
+        fallbacks = [m for m in self.models if m != model and m != "openrouter/auto"] if self.config.fallbacks else None
         for _ in range(MAX_STEPS):
-            result = await self.llm.run(messages, model, tools=self.agent.tools(), plugins=FILE_PLUGIN if pdf else None, on_text=on_text)
+            result = await self.llm.run(messages, model, tools=self.tools_for(model), plugins=FILE_PLUGIN if pdf else None,
+                                        on_text=on_text, reasoning=reasoning, fallbacks=fallbacks, on_reasoning=on_reasoning)
+            ctx["reasoning"] = (ctx["reasoning"] + "\n\n" + result.reasoning).strip() if result.reasoning else ctx["reasoning"]
             if not result.tool_calls:
                 return
             messages.append({"role": "assistant", "content": result.text or None, "tool_calls": result.tool_calls})
@@ -479,6 +519,7 @@ class Bot:
         await self.answer(chat_id, thread_id, media.Input(text=text), turn["user_message_id"], user_row=turn["user_row"])
 
     async def suggest(self, chat_id: int, thread_id: int, turn: int, message_id: int, question: str, answer: str):
+        purpose_var.set("utility")
         try:
             raw = await self.llm.complete([{"role": "system", "content": SUGGEST_PROMPT},
                                            {"role": "user", "content": f"Question: {question[:1500]}\n\nAnswer: {answer[:3000]}"}],
@@ -509,12 +550,15 @@ class Bot:
             if not first:
                 return
             name = first[:60]
+            purpose = purpose_var.set("utility")
             try:
                 title = await self.llm.complete([{"role": "system", "content": TITLE_PROMPT}, {"role": "user", "content": first[:2000]}],
                                                 self.config.utility_model, max_tokens=30)
                 name = " ".join(title.split()).strip("\"'«».")[:128] or name
             except (LLMError, AttributeError):
                 pass  # keep the first message as the name
+            finally:
+                purpose_var.reset(purpose)
             try:
                 await self.api.call("editForumTopic", chat_id=chat_id, message_thread_id=thread_id, name=name)
             except TelegramError as exc:
@@ -528,6 +572,11 @@ class Bot:
         if self.allowed(user.get("id")):
             if data.startswith("model:"):
                 toast = await self.choose_model(query, data)
+            elif data.startswith("reason:") and data[7:] in ("auto", "low", "high"):
+                chat_id = (query.get("message") or {}).get("chat", {}).get("id", user["id"])
+                self.store.set(f"reasoning:{chat_id}", data[7:])
+                await self.edit_settings(query, chat_id, "model")
+                toast = "Рассуждения: " + REASONING[data[7:]]
             elif data.startswith("regen:"):
                 turn = self.store.turn(int(data[6:])) if data[6:].isdigit() else None
                 if not turn or not self.store.is_latest(turn):
@@ -554,6 +603,57 @@ class Bot:
                     toast = "Кнопка устарела"
         await self.api.call("answerCallbackQuery", callback_query_id=query["id"], **({"text": toast[:200]} if toast else {}))
 
+    def reasoning_level(self, chat_id) -> str:
+        level = self.store.get(f"reasoning:{chat_id}") if chat_id else None
+        return level if level in REASONING else "auto"
+
+    def tools_for(self, model: str) -> list[dict]:
+        """Function tools, web search, and OpenRouter's model-to-model tools where they make sense for this model."""
+        tools = self.agent.tools() + [SEARCH_HISTORY]
+        config = self.config
+        if config.advisor_model and model != config.advisor_model:
+            tools.append({"type": "openrouter:advisor", "parameters": {
+                "model": config.advisor_model, "max_completion_tokens": 2000,
+                "instructions": "You advise an assistant that answers a user in Telegram. Be concise and decisive; point out mistakes."}})
+        if config.worker_model and model != config.worker_model:
+            tools.append({"type": "openrouter:subagent", "parameters": {
+                "model": config.worker_model, "tools": SERVER_TOOLS, "max_tool_calls": 6, "max_completion_tokens": 4000,
+                "instructions": "Complete the delegated task exactly as described. Be concise."}})
+        if config.fusion_models:
+            tools.append({"type": "openrouter:fusion", "parameters": {
+                "analysis_models": config.fusion_models, "max_tool_calls": 2, "max_completion_tokens": 4000}})
+        return tools
+
+    def record_usage(self, chat_id, purpose: str, model: str | None, cost: float, tokens_in: int, tokens_out: int):
+        self.store.run("INSERT INTO usage(ts,chat_id,purpose,model,cost,tokens_in,tokens_out) VALUES(?,?,?,?,?,?,?)",
+                       (time.time(), chat_id, purpose, model, cost, tokens_in, tokens_out))
+
+    async def usage_text(self) -> str:
+        now = time.time()
+        periods = [("Сегодня", now - (now % 86400)), ("7 дней", now - 7 * 86400), ("30 дней", now - 30 * 86400)]
+        lines = ["# 💸 Расходы", "", "| Период | Запросов | Токенов | Стоимость |", "|:--|--:|--:|--:|"]
+        for label, since in periods:
+            row = self.store.one("SELECT COUNT(*) n, COALESCE(SUM(tokens_in+tokens_out),0) t, COALESCE(SUM(cost),0) c FROM usage WHERE ts>=?", (since,))
+            lines.append(f"| {label} | {row['n']} | {row['t']:,} | ${row['c']:.4f} |".replace(",", " "))
+        since = now - 30 * 86400
+        by_purpose = self.store.all("SELECT purpose, COALESCE(SUM(cost),0) c FROM usage WHERE ts>=? GROUP BY purpose ORDER BY c DESC", (since,))
+        if by_purpose:
+            lines += ["", "## За 30 дней: на что", "", "| Что | Стоимость |", "|:--|--:|"]
+            lines += [f"| {PURPOSES.get(r['purpose'], r['purpose'])} | ${r['c']:.4f} |" for r in by_purpose]
+        by_model = self.store.all("SELECT model, COUNT(*) n, COALESCE(SUM(cost),0) c FROM usage WHERE ts>=? GROUP BY model ORDER BY c DESC LIMIT 8", (since,))
+        if by_model:
+            lines += ["", "## За 30 дней: модели", "", "| Модель | Запросов | Стоимость |", "|:--|--:|--:|"]
+            lines += [f"| `{r['model'] or '—'}` | {r['n']} | ${r['c']:.4f} |" for r in by_model]
+        try:
+            key = await self.llm.key_info()
+            remaining = key.get("limit_remaining")
+            lines += ["", f"Ключ OpenRouter: потрачено всего **${float(key.get('usage') or 0):.2f}**"
+                      + (f", осталось лимита **${float(remaining):.2f}**" if remaining is not None else ", лимит не задан") + "."]
+        except Exception:
+            lines += ["", "_Данные ключа OpenRouter сейчас недоступны._"]
+        lines += ["", "_Стоимость озвучки — оценка по цене за символ; остальное — как считает OpenRouter, включая поиск и Advisor._"]
+        return "\n".join(lines)
+
     def price(self, model: str) -> str:
         price = self.catalog.get(model, {}).get("price")
         return f" · ${price[0]:.2f}/${price[1]:.2f}" if price else ""
@@ -561,10 +661,12 @@ class Bot:
     def settings_text(self, chat_id: int, view: str = "main") -> str:
         model = self.current_model(chat_id)
         if view == "model":
-            return f"Выберите модель. Сейчас: {model}{self.price(model)}\nЦена — $ за 1 млн токенов: ввод/вывод."
+            return (f"Выберите модель. Сейчас: {model}{self.price(model)}\nЦена — $ за 1 млн токенов: ввод/вывод.\n\n"
+                    f"Рассуждения: {REASONING[self.reasoning_level(chat_id)]}. «Глубоко» — модель думает дольше (дороже), "
+                    "ход рассуждений виден под ответом.")
         place = self.location(chat_id)
         where = (f"{place['latitude']:.4f}, {place['longitude']:.4f}" if place else "не указана")
-        return (f"⚙️ Настройки\n\nМодель: {model}{self.price(model)}\n"
+        return (f"⚙️ Настройки\n\nМодель: {model}{self.price(model)}\nРассуждения: {REASONING[self.reasoning_level(chat_id)]}\n"
                 f"Локация: {where}\nЧасовой пояс: {self.zone_label(chat_id)}")
 
     def settings_keyboard(self, chat_id: int, view: str = "main") -> dict:
@@ -573,6 +675,8 @@ class Bot:
             rows = [[{"text": ("✓ " if model == current else "") + model.split("/")[-1] + self.price(model),
                       "callback_data": f"model:{index}", **({"style": "primary"} if model == current else {})}]
                     for index, model in enumerate(self.models)]
+            level = self.reasoning_level(chat_id)
+            rows.append([{"text": ("✓ " if key == level else "") + "🧠 " + label, "callback_data": f"reason:{key}"} for key, label in REASONING.items()])
             return {"inline_keyboard": rows + [[{"text": "← Назад", "callback_data": "settings:main"}]]}
         return {"inline_keyboard": [[{"text": "🤖 Set model", "callback_data": "settings:model"}],
                                     [{"text": "📍 Set timezone/location", "callback_data": "settings:location"}]]}
@@ -638,6 +742,14 @@ class Bot:
 - **Файл** — таблицу CSV, JSON, событие для календаря (.ics), контакт (.vcf), код.
 - **Оформление**: таблицы, формулы, карты, сноски с источниками, сворачиваемые блоки, списки задач.
 
+## 🧠 Модели и память
+- Помню все прошлые разговоры, во всех топиках: спросите «что мы решили про…» — найду по смыслу и дам ссылку на топик.
+- На трудных вопросах быстрая модель советуется с более сильной (Advisor), а сильная отдаёт рутину быстрой (Subagent).
+- «Спроси несколько моделей» — соберу мнения нескольких моделей и сведу их (Fusion, дороже обычного).
+- Если выбранная модель недоступна, отвечу другой из списка.
+- `/settings` → **Set model** → **🧠 Рассуждения**: авто, быстро или глубоко (ход рассуждений — под ответом).
+- `/usage` — сколько потрачено: по дням, на что и на какие модели, остаток на ключе OpenRouter.
+
 ## ⏰ Напоминания
 Просто попросите: «напомни завтра в 9 позвонить врачу», «каждый будний день в 8:30 — зарядка».
 - 🫡 на сообщении — напоминание поставлено.
@@ -665,7 +777,7 @@ class Bot:
 - `/settings` → **Set model**: цены за 1 млн токенов.
 - `/settings` → **Set timezone/location**, или просто пришлите геолокацию (📎 → Геопозиция). Сохраню её и поставлю по ней часовой пояс; без локации — UTC.
 
-Команды: `/new` · `/tasks` · `/reset` · `/settings` · `/location` · `/info` · `/help`
+Команды: `/new` · `/tasks` · `/usage` · `/reset` · `/settings` · `/location` · `/info` · `/help`
 """
 
     def zone_label(self, chat_id: int) -> str:

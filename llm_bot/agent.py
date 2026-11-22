@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from . import outputs
-from .llm import SERVER_TOOLS, LLMError
+from .llm import SERVER_TOOLS, LLMError, chat_var, purpose_var
 from .telegram import TelegramError
 
 log = logging.getLogger("llm_bot")
@@ -79,6 +79,11 @@ class Agent:
             return json.dumps({"error": "arguments are not valid JSON"})
         if name in outputs.NAMES:
             return await self.bot.outputs.call(name, args, ctx)
+        if name == "search_history":
+            try:
+                return await self.bot.memory.search(ctx["chat_id"], str(args.get("query", "")), ctx["thread_id"])
+            except (LLMError, ValueError) as exc:
+                return json.dumps({"error": str(exc)}, ensure_ascii=False)
         try:
             if name == "set_reminder":
                 return self.set_reminder(ctx, str(args.get("text", "")).strip(), str(args.get("time", "")), args.get("repeat") or "none")
@@ -184,6 +189,8 @@ class Agent:
         row = self.watch(watch_id)
         if not row or not row["active"]:
             return
+        chat_var.set(row["chat_id"])
+        purpose_var.set("watch")
         zone = self.bot.zone(row["chat_id"])
         messages = [{"role": "system", "content": WATCH_PROMPT.format(now=datetime.now(zone).strftime("%Y-%m-%d %H:%M %Z"))},
                     {"role": "user", "content": f"Task: {row['instructions']}\n\nPrevious report:\n{row['last_report'] or '(none yet)'}"}]

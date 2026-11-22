@@ -8,7 +8,7 @@ import logging
 import secrets
 import time
 
-from .llm import SERVER_TOOLS, LLMError
+from .llm import SERVER_TOOLS, LLMError, chat_var, purpose_var
 from .telegram import TelegramError
 
 log = logging.getLogger("llm_bot")
@@ -60,6 +60,8 @@ class Surfaces:
         await self.stream(sent["inline_message_id"], question, context)
 
     async def stream(self, inline_id: str, question: str, context: str | None):
+        chat_var.set(self.bot.store.get("owner"))
+        purpose_var.set("inline")
         prompt = f"Message being discussed:\n> {context}\n\n{question}" if context else question
         messages = [{"role": "system", "content": INLINE_PROMPT}, {"role": "user", "content": prompt}]
         header = "> " + question[:300].replace("\n", " ") + "\n\n"

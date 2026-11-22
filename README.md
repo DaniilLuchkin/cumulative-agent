@@ -24,6 +24,13 @@ LLM-агент для Telegram, собранный из возможностей
 | Файлы: CSV, JSON, Markdown, код, .ics, .vcf, SVG | `send_file` → `sendDocument` (multipart) |
 | Голосовой ответ на голосовое (или по просьбе «ответь голосом») + тот же ответ текстом | OpenRouter `/audio/speech` (`TTS_MODEL`, MP3, голос по языку текста) → `sendVoice`; если озвучка не удалась — только текст |
 | Rich-блоки: формулы, карты, коллажи, сноски, `<details>`, `<aside>`, task lists | системный промпт описывает возможности Rich Markdown |
+| Советы сильной модели: быстрая модель на трудном вопросе консультируется с `ADVISOR_MODEL` | `openrouter:advisor` (предлагается, только если текущая модель — не сам советник) |
+| Делегирование рутины дешёвой модели с веб-поиском | `openrouter:subagent` с `WORKER_MODEL` (только когда текущая модель — не сам исполнитель) |
+| «Спроси несколько моделей» — панель моделей и сводный анализ | `openrouter:fusion` с `FUSION_MODELS`; модель вызывает его только по явной просьбе |
+| Рассуждения: авто / быстро / глубоко; при «глубоко» ход рассуждений — в `<details>` под ответом (в историю не попадает) | `reasoning.effort`; потоковые `delta.reasoning`, в черновике — «Размышляю…» |
+| Резервные модели: если выбранная недоступна, отвечает другая из списка | параметр `models` в Chat Completions |
+| Поиск по всем прошлым разговорам по смыслу, со ссылкой на топик | `search_history` → эмбеддинги `EMBEDDING_MODEL` (512 измерений) в SQLite, косинусное сходство; переписка индексируется в фоне |
+| `/usage` — расходы за день, 7 и 30 дней, по назначению и моделям, остаток ключа | `usage.cost` из каждого ответа OpenRouter (включая поиск и серверные инструменты), `GET /api/v1/key`; озвучка — оценка по цене за символ |
 | `@бот вопрос` в любом чате | Inline mode: `answerInlineQuery` → `chosen_inline_result` → ответ дописывается в сообщение через `editMessageText(inline_message_id)` |
 | Упоминание `@бот` в чате, где бота нет (с контекстом сообщения, на которое ответили) | Guest Mode: update `guest_message` → `answerGuestQuery` → правка `inline_message_id` |
 | `/info` — справочник по всем возможностям: разделы, таблица форматов, сворачиваемые блоки и кнопки «Настройки / Локация / Мои задачи / Новый диалог» | `sendRichMessage` (Rich Markdown, `<details>`), inline-клавиатура |
@@ -77,6 +84,11 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 | `IMAGE_MODEL` | `openai/gpt-image-2.6-flare` | картинки |
 | `TTS_MODEL` | `microsoft/mai-voice-2.1-flash` | голосовые ответы, $15 за 1 млн символов |
 | `TTS_VOICE_RU` / `TTS_VOICE_EN` | `ru-RU-Lev:…` / `en-US-Grant:…` | голос выбирается по языку ответа |
+| `ADVISOR_MODEL` | `openai/gpt-6.2-sol` | советник; пусто — выключен |
+| `WORKER_MODEL` | `deepseek/deepseek-v4.1-flash` | исполнитель подзадач; пусто — выключен |
+| `FUSION_MODELS` | DeepSeek V4.1 Flash, GPT-6.2 Sol, Gemini 4 Hydrogen | панель для Fusion; пусто — выключен |
+| `EMBEDDING_MODEL` | `openai/text-embedding-3-small` | поиск по истории, $0,02 за 1 млн токенов |
+| `FALLBACKS` | `on` | `off` — без резервных моделей |
 | `SUGGESTIONS` | `on` | `off` — без вопросов под ответом (на 1 запрос меньше) |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
 | `MAX_OUTPUT_TOKENS` | 4096 | |

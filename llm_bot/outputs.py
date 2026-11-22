@@ -5,7 +5,7 @@ import re
 import zlib
 from pathlib import Path
 
-from .llm import LLMError
+from .llm import LLMError, purpose_var
 from .telegram import TelegramError
 
 log = logging.getLogger("llm_bot")
@@ -101,6 +101,13 @@ class Outputs:
         self.bot = bot
 
     async def call(self, name: str, args: dict, ctx: dict) -> str:
+        token = purpose_var.set({"show_widget": "widget", "generate_image": "image"}.get(name, purpose_var.get()))
+        try:
+            return await self._call(name, args, ctx)
+        finally:
+            purpose_var.reset(token)
+
+    async def _call(self, name: str, args: dict, ctx: dict) -> str:
         try:
             if name == "show_widget":
                 return await self.widget(ctx, str(args.get("description", "")), str(args.get("caption", "")), bool(args.get("ask_bot")))
@@ -218,11 +225,14 @@ class Outputs:
         text = speakable(markdown)[:3000]
         if not text:
             return False
+        token = purpose_var.set("voice")
         try:
-            audio = await self.bot.llm.speech(text, self.bot.config.tts_model, self.voice_for(text))
+            audio = await self.bot.llm.speech(text, self.bot.config.tts_model, self.voice_for(text), self.bot.config.tts_price_per_char)
             target = self.bot._target(chat_id, thread_id, reply_to)
             await self.bot.api.upload("sendVoice", "voice", "answer.mp3", audio, "audio/mpeg", **target)
             return True
         except (LLMError, TelegramError) as exc:
             log.warning("voice answer failed: %s", exc)
             return False
+        finally:
+            purpose_var.reset(token)

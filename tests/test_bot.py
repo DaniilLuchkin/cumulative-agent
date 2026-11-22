@@ -71,7 +71,7 @@ class FakeLLM:
             return '["Почему так?", "Пример", "Короче"]'
         return self.completions[0]
 
-    async def speech(self, text, model, voice):
+    async def speech(self, text, model, voice, price_per_char=0):
         self.spoken = (text, model, voice)
         return b"ID3mp3"
 
@@ -83,21 +83,38 @@ class FakeLLM:
         self.transcribed = (audio, fmt, model)
         return "Какая завтра погода"
 
-    async def run(self, messages, model=None, tools=None, plugins=None, on_text=None):
+    async def embed(self, texts, model, dimensions=512):
+        self.embedded = getattr(self, "embedded", 0) + len(texts)
+        words = ["борщ", "свёкла", "отпуск", "казань", "налоги", "python"]
+        return [[float(w in text.lower()) + 0.01 for w in words] for text in texts]
+
+    async def key_info(self):
+        return {"usage": 1.25, "limit_remaining": 8.75}
+
+    async def run(self, messages, model=None, tools=None, plugins=None, on_text=None, reasoning=None, fallbacks=None, on_reasoning=None):
         self.requests.append(json.loads(json.dumps(messages)))
         self.models.append(model)
-        self.plugins = plugins
+        self.plugins, self.tools, self.reasoning, self.fallbacks = plugins, tools, reasoning, fallbacks
+        if on_reasoning and getattr(self, "think", None):
+            on_reasoning(self.think)
         if self.error:
             raise LLMError(self.error)
         step = self.script.pop(0) if self.script else ("Привет", ", **мир**", "!")
         if isinstance(step, Result):
             return step
+        if getattr(self, "think", None):
+            result = Result(reasoning=self.think)
+        else:
+            result = None
         text = ""
         for chunk in step:
             await asyncio.sleep(self.pause)
             text += chunk
             if on_text:
                 on_text(text)
+        if result:
+            result.text = text
+            return result
         return Result(text=text)
 
 
@@ -135,7 +152,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_and_topics_detected(self):
         self.assertTrue(self.bot.topics_enabled)
         commands = self.api.sent("setMyCommands")[0]
-        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "reset", "settings", "location", "info", "help"])
+        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "usage", "reset", "settings", "location", "info", "help"])
 
     async def test_streams_thinking_then_drafts_then_rich_answer_with_reactions(self):
         await self.bot.on_message(message("Как дела?"))
@@ -539,6 +556,107 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for item in ("<tg-map", "$$", "[^1]", "<details>", "tg-collage", "show_widget", "create_poll", "generate_image", "send_file", "answer_with_voice"):
             self.assertIn(item, prompt)
 
+    # --- OpenRouter extras -------------------------------------------------------------------
+
+    def tool_types(self):
+        return [t.get("type") if t.get("type") != "function" else t["function"]["name"] for t in self.llm.tools]
+
+    async def test_cheap_model_gets_advisor_strong_model_gets_subagent(self):
+        self.bot.store.set("model:123", "deepseek/deepseek-v4.1-flash")
+        await self.bot.on_message(message("Сложный вопрос"))
+        types = self.tool_types()
+        self.assertIn("openrouter:advisor", types)
+        self.assertNotIn("openrouter:subagent", types)  # the worker is the model itself
+        self.assertIn("openrouter:fusion", types)
+        self.assertIn("search_history", types)
+        advisor = next(t for t in self.llm.tools if t["type"] == "openrouter:advisor")
+        self.assertEqual(advisor["parameters"]["model"], "openai/gpt-6.2-sol")
+        self.assertEqual(self.llm.fallbacks, ["openai/gpt-6.2-sol"])
+        self.bot.store.set("model:123", "openai/gpt-6.2-sol")
+        await self.bot.on_message(message("Ещё", 11))
+        types = self.tool_types()
+        self.assertNotIn("openrouter:advisor", types)
+        worker = next(t for t in self.llm.tools if t["type"] == "openrouter:subagent")
+        self.assertEqual((worker["parameters"]["model"], worker["parameters"]["tools"][0]["type"]), ("deepseek/deepseek-v4.1-flash", "openrouter:web_search"))
+        self.assertEqual(self.llm.fallbacks, ["deepseek/deepseek-v4.1-flash"])
+
+    async def test_extras_can_be_switched_off(self):
+        self.bot.config.advisor_model = self.bot.config.worker_model = ""
+        self.bot.config.fusion_models, self.bot.config.fallbacks = [], False
+        await self.bot.on_message(message("Привет"))
+        self.assertFalse([t for t in self.tool_types() if t in ("openrouter:advisor", "openrouter:subagent", "openrouter:fusion")])
+        self.assertIsNone(self.llm.fallbacks)
+
+    async def test_reasoning_levels_from_model_settings(self):
+        await self.bot.on_message(message("/settings"))
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "settings:model", "message": {"message_id": 5, "chat": {"id": 123}}})
+        row = self.api.sent("editMessageText")[-1]["reply_markup"]["inline_keyboard"][-2]
+        self.assertEqual([b["callback_data"] for b in row], ["reason:auto", "reason:low", "reason:high"])
+        await self.bot.on_message(message("Быстрый", 11))
+        self.assertIsNone(self.llm.reasoning)
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "reason:high", "message": {"message_id": 5, "chat": {"id": 123}}})
+        self.assertIn("Рассуждения: глубоко", self.api.sent("editMessageText")[-1]["text"])
+        self.llm.think = "Сначала разложу задачу на шаги."
+        await self.bot.on_message(message("Задача", 12))
+        self.assertEqual(self.llm.reasoning, {"effort": "high"})
+        final = self.api.sent("sendRichMessage")[-1]["rich_message"]["markdown"]
+        self.assertIn("<details><summary>🧠 Ход рассуждений</summary>", final)
+        self.assertIn("Сначала разложу задачу", final)
+        self.assertNotIn("Ход рассуждений", self.llm.requests[-1][-1]["content"])
+        await self.bot.on_message(message("Дальше", 13))
+        self.assertNotIn("Ход рассуждений", json.dumps(self.llm.requests[-1], ensure_ascii=False))  # not kept in history
+
+    async def test_usage_is_recorded_by_purpose_and_reported(self):
+        self.bot.record_usage(123, "chat", "deepseek/deepseek-v4.1-flash", 0.002, 1000, 200)
+        self.bot.record_usage(123, "widget", "openai/gpt-6.2-sol", 0.01, 5000, 900)
+        self.bot.record_usage(123, "voice", "microsoft/mai-voice-2.1-flash", 0.0015, 0, 0)
+        await self.bot.on_message(message("/usage"))
+        text = self.api.sent("sendRichMessage")[-1]["rich_message"]["markdown"]
+        self.assertIn("| Сегодня | 3 | 7 100 | $0.0135 |", text)
+        self.assertIn("| Виджеты | $0.0100 |", text)
+        self.assertIn("`openai/gpt-6.2-sol`", text)
+        self.assertIn("потрачено всего **$1.25**, осталось лимита **$8.75**", text)
+        self.assertEqual(self.llm.requests, [])
+
+    async def test_openrouter_usage_sink_records_chat_and_purpose(self):
+        from llm_bot.llm import chat_var, purpose_var
+        rows = []
+        body = "data: " + json.dumps({"model": "m", "choices": [{"delta": {"content": "hi", "reasoning": "думаю"}}]}) + "\n\n" + \
+               "data: " + json.dumps({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.0003}}) + "\n\ndata: [DONE]\n"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=body))) as client:
+            router = OpenRouter("k", "m", client)
+            router.usage_sink = lambda *args: rows.append(args)
+            chat_var.set(42)
+            purpose_var.set("watch")
+            result = await router.run([], reasoning={"effort": "high"}, fallbacks=["b"])
+        self.assertEqual(rows, [(42, "watch", "m", 0.0003, 10, 2)])
+        self.assertEqual(result.reasoning, "думаю")
+
+    async def test_search_history_finds_other_topics(self):
+        self.bot.store.add(123, 5, "user", "Как сварить борщ без свёклы?")
+        self.bot.store.add(123, 5, "assistant", "Можно сварить зелёный борщ со щавелем.")
+        self.bot.store.add(123, 6, "user", "Налоги на вклады")
+        self.bot.store.add(999, 7, "user", "Чужой борщ")  # another chat never leaks
+        self.llm.script = [Result(tool_calls=[call("search_history", query="борщ свёкла")]), ("Нашёл: зелёный борщ.",)]
+        await self.bot.on_message(message("Что мы решили про борщ?", 20, thread=9))
+        found = json.loads(self.llm.requests[-1][-1]["content"])["results"]
+        self.assertEqual(found[0]["topic_link"], "https://t.me/test_bot/5")
+        self.assertTrue(all("Чужой" not in hit["text"] for hit in found))
+        self.assertNotIn("Налоги", found[0]["text"])
+        await self.settle()
+        self.assertEqual(self.bot.store.one("SELECT COUNT(*) n FROM embeddings")["n"], self.bot.store.one("SELECT COUNT(*) n FROM messages")["n"])
+
+    async def test_embeddings_request_and_ordering(self):
+        bodies = []
+
+        def handler(request):
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"data": [{"index": 1, "embedding": [0, 1]}, {"index": 0, "embedding": [1, 0]}], "usage": {"prompt_tokens": 4, "cost": 0}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            vectors = await OpenRouter("k", "m", client).embed(["a", "b"], "openai/text-embedding-3-small")
+        self.assertEqual(vectors, [[1, 0], [0, 1]])
+        self.assertEqual((bodies[0]["dimensions"], bodies[0]["input"]), (512, ["a", "b"]))
+
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])
         self.assertEqual(split("x" * 90, 40), ["x" * 40, "x" * 40, "x" * 10])
@@ -587,6 +705,34 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(router.server_tools)
             await router.run([], tools=tools)  # server tools are not offered again
             self.assertEqual(len(bodies[3]["tools"]), 1)
+
+    async def test_rejected_extras_keep_web_search_and_fallbacks_drop_last(self):
+        bodies = []
+        ok = "data: " + json.dumps({"choices": [{"delta": {"content": "ok"}}]}) + "\n\ndata: [DONE]\n"
+
+        def handler(request):
+            body = json.loads(request.content)
+            bodies.append(body)
+            if any(t["type"] == "openrouter:advisor" for t in body.get("tools", [])):
+                return httpx.Response(400, json={"error": {"message": "unknown tool"}})
+            return httpx.Response(200, text=ok)
+        tools = [{"type": "openrouter:advisor"}, {"type": "openrouter:web_search"}, {"type": "function", "function": {"name": "f", "parameters": {}}}]
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = OpenRouter("k", "m", client)
+            await router.run([], tools=tools, fallbacks=["b"])
+            self.assertEqual([[t["type"] for t in b["tools"]] for b in bodies], [["openrouter:advisor", "openrouter:web_search", "function"], ["openrouter:web_search", "function"]])
+            self.assertFalse(router.extra_tools)
+            self.assertTrue(router.server_tools)
+            self.assertEqual(bodies[-1]["models"], ["m", "b"])
+
+        def reject_models(request):
+            body = json.loads(request.content)
+            bodies.append(body)
+            return httpx.Response(400, json={"error": {"message": "bad models"}}) if "models" in body else httpx.Response(200, text=ok)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reject_models)) as client:
+            router = OpenRouter("k", "m", client)
+            self.assertEqual((await router.run([], fallbacks=["b"])).text, "ok")
+            self.assertFalse(router.fallbacks_ok)
 
     async def test_transcription_request(self):
         bodies = []
