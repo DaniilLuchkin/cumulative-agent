@@ -30,10 +30,17 @@ class FakeApi:
             return {"file_path": params["file_id"]}
         if method == "answerGuestQuery":
             return {"inline_message_id": "guest-1"}
-        if method in ("sendMessage", "sendRichMessage"):
+        if method in ("sendMessage", "sendRichMessage", "sendWidget", "sendPoll"):
             self.next_id += 1
             return {"message_id": self.next_id}
         return True
+
+    async def upload(self, method, field, filename, data, mime, **params):
+        self.calls.append((method, {**params, "file": (field, filename, data, mime)}))
+        if method in self.fail:
+            raise TelegramError(method, "Bad Request")
+        self.next_id += 1
+        return {"message_id": self.next_id}
 
     async def download(self, path):
         return self.files[path]
@@ -63,6 +70,14 @@ class FakeLLM:
         if "JSON array" in messages[0]["content"]:
             return '["Почему так?", "Пример", "Короче"]'
         return self.completions[0]
+
+    async def speech(self, text, model, voice):
+        self.spoken = (text, model, voice)
+        return b"ID3mp3"
+
+    async def image(self, prompt, model, aspect_ratio=None):
+        self.drawn = (prompt, model, aspect_ratio)
+        return b"\x89PNG", "image/png"
 
     async def transcribe(self, audio, fmt, model):
         self.transcribed = (audio, fmt, model)
@@ -374,7 +389,23 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_message(message(None, voice={"file_id": "voice-1", "mime_type": "audio/ogg", "file_size": 4}))
         self.assertEqual(self.llm.transcribed[1:], ("ogg", "openai/whisper-large-v3-turbo"))
         self.assertEqual(self.llm.requests[-1][-1]["content"], "Какая завтра погода")
-        self.assertTrue(self.api.sent("sendRichMessage")[-1]["rich_message"]["markdown"].startswith("> 🎙 Какая завтра погода"))
+        voice = self.api.sent("sendVoice")[-1]
+        self.assertEqual(voice["file"][1:], ("answer.mp3", b"ID3mp3", "audio/mpeg"))
+        self.assertEqual(voice["reply_parameters"]["message_id"], 10)
+        self.assertEqual(self.llm.spoken, ("Привет, мир!", "microsoft/mai-voice-2.1-flash", "ru-RU-Lev:MAI-Voice-2.1-Flash"))
+        transcript = self.api.sent("sendRichMessage")[-1]
+        self.assertTrue(transcript["rich_message"]["markdown"].startswith("> 🎙 Какая завтра погода"))
+        self.assertNotIn("reply_parameters", transcript)  # the voice message is the reply, the text is its transcript
+
+    async def test_answer_with_voice_tool_and_tts_failure_falls_back_to_text(self):
+        self.llm.script = [Result(tool_calls=[call("answer_with_voice")]), ("Hello there, friend.",)]
+        await self.bot.on_message(message("Say it aloud"))
+        self.assertEqual(self.llm.spoken[2], "en-US-Grant:MAI-Voice-2.1-Flash")
+        self.assertEqual(len(self.api.sent("sendVoice")), 1)
+        self.api.fail.add("sendVoice")
+        self.llm.script = [Result(tool_calls=[call("answer_with_voice")]), ("Ещё раз.",)]
+        await self.bot.on_message(message("Ещё", 11))
+        self.assertEqual(self.api.sent("sendRichMessage")[-1]["reply_parameters"]["message_id"], 11)
 
     async def test_pdf_and_text_documents(self):
         self.api.files["doc-pdf"] = b"%PDF-1.7"
@@ -445,6 +476,68 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.api.sent("sendMessage")[-1]["reply_markup"]["keyboard"][0][0]["request_location"])
         await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "cmd:reset", "message": {"message_id": 5, "chat": {"id": 123}}})
         self.assertEqual(len(self.api.sent("sendMessage")), 1)  # only whitelisted commands run from buttons
+
+    # --- rich outputs ------------------------------------------------------------------
+
+    async def test_widget_is_authored_size_checked_and_sent(self):
+        html = "<h3>Калькулятор</h3><button onclick=\"x()\">=</button><script>function x(){}</script>"
+        self.llm.script = [Result(tool_calls=[call("show_widget", description="Ипотечный калькулятор", caption="Калькулятор ипотеки", ask_bot=True)]),
+                           ("```html\n" + html + "\n```",), ("Вот калькулятор.",)]
+        await self.bot.on_message(message("Посчитай ипотеку"))
+        author = self.llm.requests[1]
+        self.assertIn("You write Telegram widgets", author[0]["content"])
+        self.assertIn("may message the assistant: yes", author[1]["content"])
+        widget = self.api.sent("sendWidget")[-1]
+        self.assertEqual((widget["html"], widget["caption"], widget["allow_queries"]), (html, "Калькулятор ипотеки", True))
+        self.assertTrue(any(d.get("rich_message", {}).get("html") == "<tg-thinking>Рисую виджет…</tg-thinking>" for d in self.api.sent("sendRichMessageDraft")))
+        await self.bot.on_message(message("Дальше", 11))
+        self.assertIn("[виджет: Калькулятор ипотеки]", self.llm.requests[-1][2]["content"])  # history remembers it
+        # A tap in the widget reaches the assistant as a message.
+        await self.bot.dispatch({"update_id": 9, "widget_query": {"id": "wq", "from": {"id": 123}, "chat": {"id": 123, "type": "private"},
+                                                                 "message_id": widget and 1001, "data": "say:срок 20 лет"}})
+        await self.settle()
+        self.assertEqual(self.api.sent("answerWidgetQuery")[-1], {"widget_query_id": "wq", "data": "ok"})
+        self.assertEqual(self.llm.requests[-1][-1]["content"], "[в виджете «Калькулятор ипотеки»] срок 20 лет")
+
+    async def test_oversized_widget_is_rewritten_then_rejected(self):
+        import os
+        big = os.urandom(6000).hex()  # incompressible
+        self.llm.script = [Result(tool_calls=[call("show_widget", description="x", caption="X")]), (big,), (big,), (big,), ("Не получилось.",)]
+        await self.bot.on_message(message("Нарисуй"))
+        self.assertFalse(self.api.sent("sendWidget"))
+        self.assertIn("Too large", self.llm.requests[2][-1]["content"])
+        self.assertIn("size limit", self.llm.requests[-1][-1]["content"])
+
+    async def test_quiz_and_poll(self):
+        self.llm.script = [Result(tool_calls=[call("create_poll", question="Столица Австралии?", options=["Сидней", "Канберра", "Мельбурн"],
+                                                   quiz=True, correct_option_ids=[1], explanation="Канберра — с 1913 года")]), ("Удачи!",)]
+        await self.bot.on_message(message("Проверь меня по географии"))
+        poll = self.api.sent("sendPoll")[-1]
+        self.assertEqual((poll["type"], poll["correct_option_ids"], poll["options"][1]), ("quiz", [1], {"text": "Канберра"}))
+        self.llm.script = [Result(tool_calls=[call("create_poll", question="Куда?", options=["A"])]), ("Ок",)]
+        await self.bot.on_message(message("Опрос", 11))
+        self.assertIn("at least 2 options", self.llm.requests[-1][-1]["content"])
+
+    async def test_image_and_file_are_uploaded(self):
+        self.llm.script = [Result(tool_calls=[call("generate_image", prompt="a red fox", caption="Лиса", aspect_ratio="1:1"),
+                                              call("send_file", filename="budget.csv", content="a,b\n1,2", caption="Бюджет")]), ("Готово",)]
+        await self.bot.on_message(message("Нарисуй лису и дай таблицу"))
+        photo, document = self.api.sent("sendPhoto")[-1], self.api.sent("sendDocument")[-1]
+        self.assertEqual((photo["file"][1], photo["caption"], self.llm.drawn), ("image.png", "Лиса", ("a red fox", "openai/gpt-image-2.6-flare", "1:1")))
+        self.assertEqual((document["file"][1], document["file"][2], document["file"][3]), ("budget.csv", b"a,b\n1,2", "text/csv"))
+        self.llm.script = [Result(tool_calls=[call("send_file", filename="../../etc/passwd.exe", content="x")]), ("Нельзя",)]
+        await self.bot.on_message(message("Файл", 11))
+        self.assertIn("unsupported file name", self.llm.requests[-1][-1]["content"])
+
+    def test_speakable_drops_markup(self):
+        from llm_bot.outputs import speakable
+        text = "# Итог\n**Важно:** см. [сайт](https://x.y)[^1].\n\n| a | b |\n|---|---|\n\n```py\nprint(1)\n```\n- [x] готово\n[^1]: источник"
+        self.assertEqual(speakable(text), "Итог Важно: см. сайт. (код — в тексте) готово")
+
+    def test_system_prompt_lists_rich_blocks_and_tools(self):
+        prompt = self.bot.system_message(123)["content"]
+        for item in ("<tg-map", "$$", "[^1]", "<details>", "tg-collage", "show_widget", "create_poll", "generate_image", "send_file", "answer_with_voice"):
+            self.assertIn(item, prompt)
 
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])

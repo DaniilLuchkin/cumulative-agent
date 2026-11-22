@@ -1,4 +1,6 @@
 """Thin Telegram Bot API client."""
+import json
+
 import httpx
 
 
@@ -21,6 +23,18 @@ class Api:
             return response.content
         except httpx.HTTPError as exc:
             raise TelegramError("download", type(exc).__name__) from None
+
+    async def upload(self, method: str, field: str, filename: str, data: bytes, mime: str, **params):
+        """multipart/form-data upload of one file; other parameters as form fields (JSON for objects)."""
+        form = {k: v if isinstance(v, str) else json.dumps(v) for k, v in params.items() if v is not None}
+        try:
+            response = await self.client.post(self.base + method, data=form, files={field: (filename, data, mime)}, timeout=120)
+            result = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise TelegramError(method, type(exc).__name__) from None
+        if not result.get("ok"):
+            raise TelegramError(method, str(result.get("description", response.status_code)), (result.get("parameters") or {}).get("retry_after", 0))
+        return result["result"]
 
     async def call(self, method: str, http_timeout: float = 30, **params):
         try:

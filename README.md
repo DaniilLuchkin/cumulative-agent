@@ -18,6 +18,12 @@ LLM-агент для Telegram, собранный из возможностей
 | `/tasks` — напоминания и фоновые задачи с кнопками отмены | inline-клавиатура, правка на месте |
 | Фото, PDF, текстовые файлы, голосовые | `getFile`; фото — vision-модель (если выбранная не умеет, берётся первая из списка, которая умеет); PDF — `file-parser`; голос — `/audio/transcriptions` |
 | Отдельные диалоги в топиках, названия ставит модель | `createForumTopic`, `editForumTopic`, `forum_topic_created.is_name_implicit` |
+| Виджет в сообщении: калькулятор, график, таймер, флеш-карточки, мини-игра — модель решает сама | инструмент `show_widget` → отдельный вызов модели с [официальными правилами Telegram для LLM](https://core.telegram.org/bots/widgets.md#writing-widgets-with-an-llm) пишет HTML; размер проверяется zlib (≤ 4096 байт), при превышении — до 2 переписываний; `sendWidget`. Нажатия с `ask_bot` → `widget_query` → `answerWidgetQuery` и ответ агента в чате |
+| Опросы и викторины | `create_poll` → `sendPoll` (`type: quiz`, `correct_option_ids`, `explanation`) |
+| Картинки | `generate_image` → OpenRouter `IMAGE_MODEL` (chat completions, `modalities: image`) → `sendPhoto` |
+| Файлы: CSV, JSON, Markdown, код, .ics, .vcf, SVG | `send_file` → `sendDocument` (multipart) |
+| Голосовой ответ на голосовое (или по просьбе «ответь голосом») + тот же ответ текстом | OpenRouter `/audio/speech` (`TTS_MODEL`, MP3, голос по языку текста) → `sendVoice`; если озвучка не удалась — только текст |
+| Rich-блоки: формулы, карты, коллажи, сноски, `<details>`, `<aside>`, task lists | системный промпт описывает возможности Rich Markdown |
 | `@бот вопрос` в любом чате | Inline mode: `answerInlineQuery` → `chosen_inline_result` → ответ дописывается в сообщение через `editMessageText(inline_message_id)` |
 | Упоминание `@бот` в чате, где бота нет (с контекстом сообщения, на которое ответили) | Guest Mode: update `guest_message` → `answerGuestQuery` → правка `inline_message_id` |
 | `/info` — справочник по всем возможностям: разделы, таблица форматов, сворачиваемые блоки и кнопки «Настройки / Локация / Мои задачи / Новый диалог» | `sendRichMessage` (Rich Markdown, `<details>`), inline-клавиатура |
@@ -68,6 +74,9 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 | `UTILITY_MODEL` | `deepseek/deepseek-v4.1-flash` | названия топиков и вопросы под ответом |
 | `TRANSCRIBE_MODEL` | `openai/whisper-large-v3-turbo` | голосовые |
 | `TIMEZONE` | `UTC` | пояс, пока локация не указана |
+| `IMAGE_MODEL` | `openai/gpt-image-2.6-flare` | картинки |
+| `TTS_MODEL` | `microsoft/mai-voice-2.1-flash` | голосовые ответы, $15 за 1 млн символов |
+| `TTS_VOICE_RU` / `TTS_VOICE_EN` | `ru-RU-Lev:…` / `en-US-Grant:…` | голос выбирается по языку ответа |
 | `SUGGESTIONS` | `on` | `off` — без вопросов под ответом (на 1 запрос меньше) |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
 | `MAX_OUTPUT_TOKENS` | 4096 | |

@@ -21,7 +21,7 @@ from datetime import datetime
 from html import escape
 from zoneinfo import ZoneInfo
 
-from . import geo, media
+from . import geo, media, outputs
 from .agent import Agent
 from .inline import Surfaces
 from .llm import FILE_PLUGIN, LLMError
@@ -34,9 +34,17 @@ RICH_LIMIT = 32000  # sendRichMessage: up to 32768 characters
 TEXT_LIMIT = 4000   # sendMessage / sendMessageDraft: up to 4096 characters
 MAX_STEPS = 5       # model calls per answer when tools are used
 DEFAULT_PROMPT = ("You are a helpful personal assistant in a Telegram chat. Reply in the language of the user's last message. "
-                  "Be concise unless asked for detail. Use Markdown: headings, lists, task lists, tables, fenced code blocks, "
-                  "<details> for long optional parts, footnotes for sources. "
-                  "You can set reminders and start background watches with your tools, and search the web for current facts.")
+                  "Be concise unless asked for detail.\n"
+                  "Your answer is rendered as a Telegram Rich Message (GitHub-flavored Markdown plus some HTML). Use what fits: "
+                  "headings, lists, task lists (- [ ] / - [x]), tables with alignment, fenced code blocks with a language, ==marked==, "
+                  "||spoiler||, footnotes ([^1] with definitions) for sources, math as $x^2$ or $$...$$ (LaTeX), "
+                  "<details><summary>title</summary>...</details> for long optional parts, <aside>quote<cite>author</cite></aside> for pull quotes, "
+                  "<tg-map lat=\"55.75\" long=\"37.62\" zoom=\"13\"/> to show a place, an image from a public https URL as its own block "
+                  "![](https://... \"caption\"), several images in <tg-collage> or <tg-slideshow>.\n"
+                  "Tools: set reminders and background watches; search the web for current facts; show_widget for interactive or visual "
+                  "content (calculators, charts, timers, flashcards, mini-games); create_poll for polls and quizzes; generate_image for "
+                  "pictures; send_file for downloadable text files (CSV, JSON, .ics, code); answer_with_voice when asked to speak. "
+                  "Pick a tool only when it serves the user better than plain text.")
 CONTEXT_PROMPT = "Current local time of the user: {now} ({zone})."
 UNKNOWN_ZONE_PROMPT = ("The user's time zone is not set, UTC is assumed. When times of day matter (reminders, schedules), "
                        "say that the user can send their location to set the time zone.")
@@ -45,7 +53,7 @@ TITLE_PROMPT = ("Name this conversation in 2-5 words in the language of the user
 SUGGEST_PROMPT = ("Suggest 3 short follow-up questions the user may ask next, in the user's language, each under 40 characters. "
                   "Reply with a JSON array of strings only.")
 TOOL_STATUS = {"set_reminder": "Ставлю напоминание…", "start_watch": "Запускаю фоновую задачу…",
-               "list_scheduled": "Смотрю расписание…", "cancel_scheduled": "Отменяю…"}
+               "list_scheduled": "Смотрю расписание…", "cancel_scheduled": "Отменяю…", **outputs.STATUS}
 SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
 COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("reset", "Очистить контекст"),
@@ -56,7 +64,7 @@ INFO_KEYBOARD = {"inline_keyboard": [
     [{"text": "⚙️ Настройки", "callback_data": "cmd:settings"}, {"text": "📍 Локация", "callback_data": "cmd:location"}],
     [{"text": "📋 Мои задачи", "callback_data": "cmd:tasks"}, {"text": "💬 Новый диалог", "callback_data": "cmd:new"}]]}
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
-                   "guest_message", "stopped_message_generation"]
+                   "guest_message", "widget_query", "stopped_message_generation"]
 
 
 @dataclass
@@ -67,6 +75,10 @@ class Config:
     models: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
     utility_model: str = "deepseek/deepseek-v4.1-flash"     # titles and follow-up suggestions
     transcribe_model: str = "openai/whisper-large-v3-turbo"
+    image_model: str = "openai/gpt-image-2.6-flare"
+    tts_model: str = "microsoft/mai-voice-2.1-flash"
+    tts_voice_ru: str = "ru-RU-Lev:MAI-Voice-2.1-Flash"
+    tts_voice_en: str = "en-US-Grant:MAI-Voice-2.1-Flash"
     timezone: str = "UTC"
     system_prompt: str = DEFAULT_PROMPT
     allowed_ids: set[int] = field(default_factory=set)
@@ -88,7 +100,9 @@ class Config:
         ids = {int(x) for x in env("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
         return cls(telegram_token=env("TELEGRAM_BOT_TOKEN"), openrouter_key=env("OPENROUTER_API_KEY"),
                    model=env("LLM_MODEL") or cls.model, models=models, utility_model=env("UTILITY_MODEL") or cls.utility_model,
-                   transcribe_model=env("TRANSCRIBE_MODEL") or cls.transcribe_model, timezone=env("TIMEZONE") or cls.timezone,
+                   transcribe_model=env("TRANSCRIBE_MODEL") or cls.transcribe_model, image_model=env("IMAGE_MODEL") or cls.image_model,
+                   tts_model=env("TTS_MODEL") or cls.tts_model, tts_voice_ru=env("TTS_VOICE_RU") or cls.tts_voice_ru,
+                   tts_voice_en=env("TTS_VOICE_EN") or cls.tts_voice_en, timezone=env("TIMEZONE") or cls.timezone,
                    system_prompt=env("SYSTEM_PROMPT") or DEFAULT_PROMPT, allowed_ids=ids, database=env("BOT_DB", cls.database),
                    max_tokens=int(env("MAX_OUTPUT_TOKENS", cls.max_tokens)), history_chars=int(env("HISTORY_CHARS", cls.history_chars)),
                    suggestions=env("SUGGESTIONS", "on").lower() not in ("0", "off", "false", "no"))
@@ -148,7 +162,7 @@ class Bot:
         self.tasks: set[asyncio.Task] = set()
         self.catalog: dict[str, dict] = {}
         self.models = list(dict.fromkeys([config.model, *config.models]))  # the configured default is always selectable
-        self.agent, self.surfaces = Agent(self), Surfaces(self)
+        self.agent, self.surfaces, self.outputs = Agent(self), Surfaces(self), outputs.Outputs(self)
 
     # --- setup, polling, scheduler -------------------------------------------------
 
@@ -220,6 +234,8 @@ class Bot:
                 await self.surfaces.on_chosen(update["chosen_inline_result"])
             elif "guest_message" in update:
                 await self.surfaces.on_guest(update["guest_message"])
+            elif "widget_query" in update:
+                await self.outputs.on_widget_query(update["widget_query"])
         except Exception:
             log.exception("update %s failed", update.get("update_id"))
 
@@ -387,7 +403,8 @@ class Bot:
         draft_id = message_id or random.randint(1, 2**31 - 1)
         stop_key = (chat_id, draft_id)
         draft = Draft(self, chat_id, thread_id, draft_id)
-        ctx = {"chat_id": chat_id, "thread_id": thread_id, "zone": self.zone(chat_id), "reaction": None}
+        ctx = {"chat_id": chat_id, "thread_id": thread_id, "zone": self.zone(chat_id), "reaction": None,
+               "voice": bool(content.transcript), "artifacts": []}
         pusher = asyncio.create_task(draft.run())
         generation = asyncio.create_task(self.generate(messages, draft, self.model_for(chat_id, content.needs), ctx, content.pdf))
         self.generations[stop_key] = generation
@@ -409,11 +426,17 @@ class Bot:
             return
         log.info("answered in chat %s topic %s with %s", chat_id, thread_id, getattr(self.llm, "last_model", None) or self.current_model(chat_id))
         result = draft.text.strip()
-        assistant_row = self.store.add(chat_id, thread_id, "assistant", result) if result else None
+        remembered = "\n".join([result, *ctx["artifacts"]]).strip()  # history knows what else was sent
+        assistant_row = self.store.add(chat_id, thread_id, "assistant", remembered) if remembered else None
         if stopped:
             result = (result + "\n\n_Генерация остановлена._") if result else "Генерация остановлена."
+        elif not result and ctx["artifacts"]:
+            result = "Готово."
         turn = self.store.add_turn(chat_id, thread_id, message_id, user_row, assistant_row, [])
-        sent = await self.send_markdown(chat_id, thread_id, prefix + result, message_id, self.answer_keyboard(turn, []))
+        reply_to = message_id
+        if ctx["voice"] and not stopped and await self.outputs.send_voice(chat_id, thread_id, result, message_id):
+            reply_to = None  # the voice message replies; the text below is its transcript
+        sent = await self.send_markdown(chat_id, thread_id, prefix + result, reply_to, self.answer_keyboard(turn, []))
         self.store.run("UPDATE turns SET bot_message_ids=? WHERE id=?", (json.dumps(sent), turn))
         await self.react(chat_id, message_id, ctx["reaction"])
         await self.autoname(chat_id, thread_id)
@@ -604,7 +627,16 @@ class Bot:
 | Фото или картинку | Опишу, прочитаю текст, отвечу на вопрос в подписи |
 | PDF | Перескажу или найду нужное |
 | Текстовый файл, код, CSV | Разберу, проверю, объясню |
-| Голосовое | Распознаю и отвечу; расшифровку покажу цитатой |
+| Голосовое | Распознаю и отвечу голосовым, а ниже — тем же ответом текстом |
+
+Попросите «ответь голосом» — тоже отвечу голосовым с текстом.
+
+## 🎨 Что могу прислать
+- **Виджет** прямо в сообщении — калькулятор, график, таймер, карточки, мини-игра. С ним можно взаимодействовать; иногда нажатия приходят мне, и я отвечаю в чате.
+- **Опрос или викторину** — «проверь меня по истории», «помоги выбрать».
+- **Картинку** — «нарисуй…».
+- **Файл** — таблицу CSV, JSON, событие для календаря (.ics), контакт (.vcf), код.
+- **Оформление**: таблицы, формулы, карты, сноски с источниками, сворачиваемые блоки, списки задач.
 
 ## ⏰ Напоминания
 Просто попросите: «напомни завтра в 9 позвонить врачу», «каждый будний день в 8:30 — зарядка».

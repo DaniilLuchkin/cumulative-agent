@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from . import outputs
 from .llm import SERVER_TOOLS, LLMError
 from .telegram import TelegramError
 
@@ -66,7 +67,7 @@ class Agent:
         self.store = bot.store
 
     def tools(self) -> list[dict]:
-        return FUNCTIONS + SERVER_TOOLS
+        return FUNCTIONS + outputs.FUNCTIONS + SERVER_TOOLS
 
     # --- tool calls -----------------------------------------------------------------
 
@@ -76,6 +77,8 @@ class Agent:
             args = json.loads(call["function"]["arguments"] or "{}")
         except ValueError:
             return json.dumps({"error": "arguments are not valid JSON"})
+        if name in outputs.NAMES:
+            return await self.bot.outputs.call(name, args, ctx)
         try:
             if name == "set_reminder":
                 return self.set_reminder(ctx, str(args.get("text", "")).strip(), str(args.get("time", "")), args.get("repeat") or "none")

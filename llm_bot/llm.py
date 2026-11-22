@@ -133,6 +133,40 @@ class OpenRouter:
             raise LLMError("Модель вернула пустой ответ")
         return result
 
+    async def image(self, prompt: str, model: str, aspect_ratio: str | None = None) -> tuple[bytes, str]:
+        """Generate one image through chat completions with image output. Returns (bytes, mime)."""
+        body = {"model": model, "messages": [{"role": "user", "content": prompt}], "modalities": ["image", "text"]}
+        if aspect_ratio:
+            body["image_config"] = {"aspect_ratio": aspect_ratio}
+        for attempt in range(2):
+            try:
+                response = await self.client.post(API + "/chat/completions", json=body, headers=self.headers, timeout=180)
+            except httpx.HTTPError as exc:
+                raise LLMError("Генерация картинки: " + type(exc).__name__) from None
+            if response.status_code == 400 and attempt == 0:
+                body["modalities"] = ["image"]  # image-only models reject the text modality
+                continue
+            if response.status_code != 200:
+                raise LLMError(f"Генерация картинки: HTTP {response.status_code} {_detail(response.content)}".strip()[:300])
+            break
+        try:
+            url = response.json()["choices"][0]["message"]["images"][0]["image_url"]["url"]
+            header, encoded = url.split(",", 1)
+            return base64.b64decode(encoded), header.removeprefix("data:").split(";")[0] or "image/png"
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise LLMError("Модель не вернула картинку") from None
+
+    async def speech(self, text: str, model: str, voice: str) -> bytes:
+        """Text to speech as MP3 (Telegram plays MP3 as a voice message)."""
+        body = {"model": model, "input": text, "voice": voice, "response_format": "mp3"}
+        try:
+            response = await self.client.post(API + "/audio/speech", json=body, headers=self.headers, timeout=180)
+        except httpx.HTTPError as exc:
+            raise LLMError("Озвучка: " + type(exc).__name__) from None
+        if response.status_code != 200 or not response.content:
+            raise LLMError(f"Озвучка: HTTP {response.status_code} {_detail(response.content)}".strip()[:300])
+        return response.content
+
     async def transcribe(self, audio: bytes, fmt: str, model: str) -> str:
         body = {"model": model, "input_audio": {"data": base64.b64encode(audio).decode(), "format": fmt}}
         try:
