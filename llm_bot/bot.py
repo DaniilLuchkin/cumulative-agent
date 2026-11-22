@@ -51,6 +51,8 @@ DEFAULT_PROMPT = ("You are a helpful personal assistant in a Telegram chat. Repl
                   "multi-model panel: use it only when the user explicitly asks for several opinions or a model comparison. "
                   "Pick a tool only when it serves the user better than plain text.")
 CONTEXT_PROMPT = "Current local time of the user: {now} ({zone})."
+IDENTITY_PROMPT = ("You are the model {model}, served through OpenRouter in this Telegram bot. If asked which model or AI you are, "
+                   "say exactly that; do not claim to be another model or company.")
 UNKNOWN_ZONE_PROMPT = ("The user's time zone is not set, UTC is assumed. When times of day matter (reminders, schedules), "
                        "say that the user can send their location to set the time zone.")
 TITLE_PROMPT = ("Name this conversation in 2-5 words in the language of the user's message. "
@@ -396,10 +398,14 @@ class Bot:
 
     # --- answering -----------------------------------------------------------------
 
-    def system_message(self, chat_id: int) -> dict:
+    def system_message(self, chat_id: int, model: str | None = None) -> dict:
         zone = self.zone(chat_id)
         now = datetime.now(zone).strftime("%A %Y-%m-%d %H:%M")
         content = self.config.system_prompt + "\n" + CONTEXT_PROMPT.format(now=now, zone=zone.key)
+        model = model or self.current_model(chat_id)
+        if model != "openrouter/auto":
+            # Models guess their own name from training data; tell them which one actually runs.
+            content += "\n" + IDENTITY_PROMPT.format(model=model)
         if not self.store.get(f"timezone:{chat_id}") and not os.environ.get("TIMEZONE"):
             content += "\n" + UNKNOWN_ZONE_PROMPT
         return {"role": "system", "content": content}
@@ -421,7 +427,8 @@ class Bot:
         await self.react(chat_id, message_id, "👀")
         if user_row is None:
             user_row = self.store.add(chat_id, thread_id, "user", content.text)
-        messages = [self.system_message(chat_id), *self.store.history(chat_id, thread_id, self.config.history_chars)]
+        model = self.model_for(chat_id, content.needs)
+        messages = [self.system_message(chat_id, model), *self.store.history(chat_id, thread_id, self.config.history_chars)]
         if content.parts and messages[-1]["role"] == "user":
             messages[-1] = {"role": "user", "content": content.parts}
         if content.transcript:
@@ -432,7 +439,7 @@ class Bot:
         ctx = {"chat_id": chat_id, "thread_id": thread_id, "zone": self.zone(chat_id), "reaction": None,
                "voice": bool(content.transcript), "artifacts": [], "reasoning": ""}
         pusher = asyncio.create_task(draft.run())
-        generation = asyncio.create_task(self.generate(messages, draft, self.model_for(chat_id, content.needs), ctx, content.pdf))
+        generation = asyncio.create_task(self.generate(messages, draft, model, ctx, content.pdf))
         self.generations[stop_key] = generation
         stopped, error = False, None
         try:

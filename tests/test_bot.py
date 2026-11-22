@@ -594,6 +594,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         text = "# Итог\n**Важно:** см. [сайт](https://x.y)[^1].\n\n| a | b |\n|---|---|\n\n```py\nprint(1)\n```\n- [x] готово\n[^1]: источник"
         self.assertEqual(speakable(text), "Итог Важно: см. сайт. (код — в тексте) готово")
 
+    async def test_model_is_told_its_own_name(self):
+        self.bot.store.set("model:123", "deepseek/deepseek-v4.1-flash")
+        await self.bot.on_message(message("Ты кто?"))
+        self.assertIn("You are the model deepseek/deepseek-v4.1-flash", self.llm.requests[-1][0]["content"])
+        self.bot.store.set("model:123", "openrouter/auto")
+        await self.bot.on_message(message("А сейчас?", 11))
+        self.assertNotIn("You are the model", self.llm.requests[-1][0]["content"])  # auto picks the model per request
+
     def test_system_prompt_lists_rich_blocks_and_tools(self):
         prompt = self.bot.system_message(123)["content"]
         for item in ("<tg-map", "$$", "[^1]", "<details>", "tg-collage", "show_widget", "create_poll", "generate_image", "send_file", "answer_with_voice"):
