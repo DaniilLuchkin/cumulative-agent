@@ -91,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 | `FALLBACKS` | `on` | `off` — без резервных моделей |
 | `SUGGESTIONS` | `on` | `off` — без вопросов под ответом (на 1 запрос меньше) |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
-| `MAX_OUTPUT_TOKENS` | 4096 | |
+| `MAX_OUTPUT_TOKENS` | 16000 | ответ вместе с рассуждениями; в режиме «глубоко» — вдвое больше; при нехватке — повтор с короткими рассуждениями | |
 | `HISTORY_CHARS` | 24000 | |
 | `BOT_DB` | `data/bot.sqlite3` | |
 

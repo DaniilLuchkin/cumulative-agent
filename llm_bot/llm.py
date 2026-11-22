@@ -24,6 +24,10 @@ class LLMError(Exception):
     pass
 
 
+class TokenLimit(LLMError):
+    """The output limit was spent (usually on reasoning) before any answer text."""
+
+
 @dataclass
 class Result:
     text: str = ""
@@ -42,7 +46,7 @@ def _detail(raw: bytes) -> str:
 
 
 class OpenRouter:
-    def __init__(self, api_key: str, model: str, client: httpx.AsyncClient, max_tokens: int = 4096, timeout: float = 300):
+    def __init__(self, api_key: str, model: str, client: httpx.AsyncClient, max_tokens: int = 16000, timeout: float = 300):
         self.api_key, self.model, self.client = api_key, model, client
         self.max_tokens, self.timeout = max_tokens, timeout
         self.last_model = None  # model that actually served the last answer (differs for openrouter/auto)
@@ -192,7 +196,7 @@ class OpenRouter:
         result.tool_calls = [calls[i] for i in sorted(calls) if calls[i]["function"]["name"]]
         if not result.text.strip() and not result.tool_calls:
             if result.finish_reason == "length":
-                raise LLMError("Модель израсходовала лимит токенов на рассуждения и не успела написать ответ")
+                raise TokenLimit("Модель израсходовала лимит токенов на рассуждения и не успела написать ответ")
             raise LLMError("Модель вернула пустой ответ")
         return result
 

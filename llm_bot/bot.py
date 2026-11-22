@@ -25,7 +25,7 @@ from . import geo, media, outputs
 from .memory import FUNCTION as SEARCH_HISTORY, Memory
 from .agent import Agent
 from .inline import Surfaces
-from .llm import FILE_PLUGIN, SERVER_TOOLS, LLMError, chat_var, purpose_var
+from .llm import FILE_PLUGIN, SERVER_TOOLS, LLMError, TokenLimit, chat_var, purpose_var
 from .store import Store
 from .telegram import Api, TelegramError
 
@@ -98,7 +98,7 @@ class Config:
     system_prompt: str = DEFAULT_PROMPT
     allowed_ids: set[int] = field(default_factory=set)
     database: str = "data/bot.sqlite3"
-    max_tokens: int = 4096
+    max_tokens: int = 16000      # answer + reasoning; only generated tokens are billed
     history_chars: int = 24000
     draft_interval: float = 0.8   # seconds between streamed draft updates
     draft_keepalive: float = 20   # drafts are 30-second previews
@@ -486,9 +486,20 @@ class Bot:
         level = self.reasoning_level(ctx["chat_id"])
         reasoning = {"low": {"effort": "low"}, "high": {"effort": "high"}}.get(level)
         fallbacks = [m for m in self.models if m != model and m != "openrouter/auto"] if self.config.fallbacks else None
+        limit = self.config.max_tokens * (2 if level == "high" else 1)
         for _ in range(MAX_STEPS):
-            result = await self.llm.run(messages, model, tools=self.tools_for(model), plugins=FILE_PLUGIN if pdf else None,
-                                        on_text=on_text, reasoning=reasoning, fallbacks=fallbacks, on_reasoning=on_reasoning)
+            options = dict(tools=self.tools_for(model), plugins=FILE_PLUGIN if pdf else None, on_text=on_text,
+                           fallbacks=fallbacks, on_reasoning=on_reasoning)
+            try:
+                result = await self.llm.run(messages, model, reasoning=reasoning, max_tokens=limit, **options)
+            except TokenLimit:
+                # The model thought until the limit: once more, thinking briefly with twice the room.
+                log.warning("token limit reached in chat %s, retrying with low reasoning", ctx["chat_id"])
+                draft.status = "Думаю слишком долго — отвечаю короче…"
+                limit *= 2
+                result = await self.llm.run(messages, model, reasoning={"effort": "low"}, max_tokens=limit, **options)
+            if result.finish_reason == "length" and result.text and not result.tool_calls:
+                draft.text = result.text + "\n\n_…ответ обрезан: закончился лимит длины._"
             ctx["reasoning"] = (ctx["reasoning"] + "\n\n" + result.reasoning).strip() if result.reasoning else ctx["reasoning"]
             if not result.tool_calls:
                 return

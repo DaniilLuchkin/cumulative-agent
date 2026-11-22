@@ -534,6 +534,25 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [("deepseek/deepseek-v4.1-flash", 16000, {"effort": "low"}), ("openai/gpt-6.2-sol", 16000, {"effort": "low"})])
         self.assertEqual(self.api.sent("sendWidget")[-1]["html"], "<p>Карта</p>")
 
+    async def test_token_limit_retries_with_low_reasoning_and_more_room(self):
+        from llm_bot.llm import TokenLimit
+        original, seen = self.llm.run, []
+
+        async def run(messages, model=None, **kwargs):
+            seen.append((kwargs.get("reasoning"), kwargs.get("max_tokens")))
+            if len(seen) == 1:
+                raise TokenLimit("Модель израсходовала лимит токенов на рассуждения и не успела написать ответ")
+            return await original(messages, model, **kwargs)
+        self.llm.run = run
+        await self.bot.on_message(message("Сложная задача"))
+        self.assertEqual(seen, [(None, 16000), ({"effort": "low"}, 32000)])
+        self.assertEqual(self.api.sent("sendRichMessage")[-1]["rich_message"]["markdown"], "Привет, **мир**!")
+
+    async def test_truncated_answer_is_marked(self):
+        self.llm.script = [Result(text="Длинный ответ", finish_reason="length")]
+        await self.bot.on_message(message("Расскажи всё"))
+        self.assertIn("ответ обрезан", self.api.sent("sendRichMessage")[-1]["rich_message"]["markdown"])
+
     async def test_length_cut_is_reported_clearly(self):
         body = "data: " + json.dumps({"choices": [{"delta": {"reasoning": "..."}, "finish_reason": "length"}]}) + "\n\ndata: [DONE]\n"
         async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=body))) as client:
