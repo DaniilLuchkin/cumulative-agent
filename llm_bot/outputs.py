@@ -23,6 +23,7 @@ THIS BOT
   and the error code on failure. Otherwise never call request().
 - Always render something useful immediately; the widget can be destroyed and recreated at any time."""
 MAX_HTML, MAX_COMPRESSED = 32768, 4096
+WIDGET_MAX_TOKENS = 16000
 SAFE_FILE = re.compile(r"^[\w\-. ]{1,64}\.(txt|md|csv|tsv|json|xml|yaml|yml|html|css|js|ts|py|sql|sh|ini|toml|svg|ics|vcf|log)$", re.UNICODE)
 MIME = {"csv": "text/csv", "tsv": "text/tab-separated-values", "json": "application/json", "html": "text/html", "svg": "image/svg+xml",
         "ics": "text/calendar", "vcf": "text/vcard", "xml": "application/xml", "md": "text/markdown"}
@@ -138,10 +139,11 @@ class Outputs:
             raise ValueError("description is empty")
         request = f"Caption: {caption}\nThe widget may message the assistant: {'yes' if ask_bot else 'no'}\n\n{description}"
         messages = [{"role": "system", "content": WIDGET_RULES + "\n" + WIDGET_PROTOCOL}, {"role": "user", "content": request}]
-        model = self.bot.current_model(ctx["chat_id"])
+        models = [self.bot.current_model(ctx["chat_id"])]
+        models += [m for m in self.bot.models if m not in models and m != "openrouter/auto"][:1]
         html = ""
         for _ in range(3):
-            html = strip_fences((await self.bot.llm.run(messages, model)).text)
+            html = strip_fences(await self.author(messages, models))
             size, packed = len(html.encode("utf-8")), compressed_size(html)
             if html and size <= MAX_HTML and packed <= MAX_COMPRESSED:
                 break
@@ -159,6 +161,17 @@ class Outputs:
         return json.dumps({"sent": True, "compressed_bytes": compressed_size(html),
                            "note": "The widget is already in the chat above your answer; do not repeat its content, add a short comment at most."},
                           ensure_ascii=False)
+
+    async def author(self, messages: list[dict], models: list[str]) -> str:
+        """Write the widget HTML. Room for reasoning plus up to ~32 KB of HTML; another model if the first returns nothing."""
+        error = None
+        for model in models:
+            try:
+                return (await self.bot.llm.run(messages, model, reasoning={"effort": "low"}, max_tokens=WIDGET_MAX_TOKENS)).text
+            except LLMError as exc:
+                error = exc
+                log.warning("widget author %s failed: %s", model, exc)
+        raise LLMError(f"модель не написала HTML виджета ({error})")
 
     async def on_widget_query(self, query: dict):
         """A tap in a widget sent with ask_bot: answer at once, then let the assistant react in the chat."""

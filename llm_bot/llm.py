@@ -31,6 +31,7 @@ class Result:
     model: str | None = None
     reasoning: str = ""
     usage: dict | None = None
+    finish_reason: str | None = None
 
 
 def _detail(raw: bytes) -> str:
@@ -98,7 +99,7 @@ class OpenRouter:
 
     async def run(self, messages: list[dict], model: str | None = None, tools: list[dict] | None = None,
                   plugins: list[dict] | None = None, on_text=None, reasoning: dict | None = None,
-                  fallbacks: list[str] | None = None, on_reasoning=None) -> Result:
+                  fallbacks: list[str] | None = None, on_reasoning=None, max_tokens: int | None = None) -> Result:
         """One streamed model call. on_text(accumulated) is called for every text delta.
 
         A request rejected with HTTP 400 is retried with less: without the model-to-model tools
@@ -120,7 +121,7 @@ class OpenRouter:
         attempts = [(v, fallbacks) for v in variants] + ([(None, None)] if fallbacks else [])
         for index, (variant, chosen) in enumerate(attempts):
             try:
-                return await self._run(messages, model, variant, plugins, on_text, reasoning, chosen, on_reasoning)
+                return await self._run(messages, model, variant, plugins, on_text, reasoning, chosen, on_reasoning, max_tokens)
             except LLMError as exc:
                 if not str(exc).startswith("OpenRouter HTTP 400") or index == len(attempts) - 1:
                     raise
@@ -133,9 +134,9 @@ class OpenRouter:
                 log.warning("retrying with fewer options: %s", exc)
         raise LLMError("unreachable")
 
-    async def _run(self, messages, model, tools, plugins, on_text, reasoning, fallbacks, on_reasoning) -> Result:
+    async def _run(self, messages, model, tools, plugins, on_text, reasoning, fallbacks, on_reasoning, max_tokens=None) -> Result:
         model = model or self.model
-        body = {"model": model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
+        body = {"model": model, "messages": messages, "max_tokens": max_tokens or self.max_tokens, "stream": True}
         if fallbacks:
             # OpenRouter tries these in order when the first model is down or refuses.
             body["models"] = [model, *[m for m in fallbacks if m != model]]
@@ -168,6 +169,7 @@ class OpenRouter:
                     if chunk.get("usage"):
                         result.usage = chunk["usage"]
                     for choice in chunk.get("choices") or []:
+                        result.finish_reason = choice.get("finish_reason") or result.finish_reason
                         delta = choice.get("delta") or {}
                         if isinstance(delta.get("reasoning"), str) and delta["reasoning"]:
                             result.reasoning += delta["reasoning"]
@@ -189,6 +191,8 @@ class OpenRouter:
             self.record(result.model or model, result.usage)
         result.tool_calls = [calls[i] for i in sorted(calls) if calls[i]["function"]["name"]]
         if not result.text.strip() and not result.tool_calls:
+            if result.finish_reason == "length":
+                raise LLMError("Модель израсходовала лимит токенов на рассуждения и не успела написать ответ")
             raise LLMError("Модель вернула пустой ответ")
         return result
 

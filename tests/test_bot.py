@@ -91,7 +91,7 @@ class FakeLLM:
     async def key_info(self):
         return {"usage": 1.25, "limit_remaining": 8.75}
 
-    async def run(self, messages, model=None, tools=None, plugins=None, on_text=None, reasoning=None, fallbacks=None, on_reasoning=None):
+    async def run(self, messages, model=None, tools=None, plugins=None, on_text=None, reasoning=None, fallbacks=None, on_reasoning=None, max_tokens=None):
         self.requests.append(json.loads(json.dumps(messages)))
         self.models.append(model)
         self.plugins, self.tools, self.reasoning, self.fallbacks = plugins, tools, reasoning, fallbacks
@@ -515,6 +515,30 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.settle()
         self.assertEqual(self.api.sent("answerWidgetQuery")[-1], {"widget_query_id": "wq", "data": "ok"})
         self.assertEqual(self.llm.requests[-1][-1]["content"], "[в виджете «Калькулятор ипотеки»] срок 20 лет")
+
+    async def test_widget_author_gets_room_and_falls_back_to_another_model(self):
+        self.bot.store.set("model:123", "deepseek/deepseek-v4.1-flash")
+        original = self.llm.run
+        calls = []
+
+        async def run(messages, model=None, **kwargs):
+            if "You write Telegram widgets" in str(messages[0].get("content")):
+                calls.append((model, kwargs.get("max_tokens"), kwargs.get("reasoning")))
+                if model == "deepseek/deepseek-v4.1-flash":
+                    raise LLMError("Модель израсходовала лимит токенов на рассуждения и не успела написать ответ")
+                return Result(text="<p>Карта</p>")
+            return await original(messages, model, **kwargs)
+        self.llm.run = run
+        self.llm.script = [Result(tool_calls=[call("show_widget", description="карта", caption="Карта")]), ("Готово",)]
+        await self.bot.on_message(message("Сделай виджет с картой"))
+        self.assertEqual(calls, [("deepseek/deepseek-v4.1-flash", 16000, {"effort": "low"}), ("openai/gpt-6.2-sol", 16000, {"effort": "low"})])
+        self.assertEqual(self.api.sent("sendWidget")[-1]["html"], "<p>Карта</p>")
+
+    async def test_length_cut_is_reported_clearly(self):
+        body = "data: " + json.dumps({"choices": [{"delta": {"reasoning": "..."}, "finish_reason": "length"}]}) + "\n\ndata: [DONE]\n"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=body))) as client:
+            with self.assertRaisesRegex(LLMError, "лимит токенов"):
+                await OpenRouter("k", "m", client).run([], max_tokens=100)
 
     async def test_oversized_widget_is_rewritten_then_rejected(self):
         import os
