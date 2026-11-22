@@ -67,7 +67,7 @@ class Agent:
         self.store = bot.store
 
     def tools(self) -> list[dict]:
-        return FUNCTIONS + outputs.FUNCTIONS + SERVER_TOOLS
+        return FUNCTIONS + self.bot.outputs.functions() + SERVER_TOOLS
 
     # --- tool calls -----------------------------------------------------------------
 

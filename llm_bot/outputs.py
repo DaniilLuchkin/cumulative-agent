@@ -97,9 +97,19 @@ def speakable(markdown: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+class WidgetsUnavailable(Exception):
+    pass
+
+
 class Outputs:
     def __init__(self, bot):
         self.bot = bot
+        # Learned from INPUT_MEDIA_WIDGET_NOT_ALLOWED; widgets are still rolling out (topics: test server only).
+        self.widgets_in_topics = True
+        self.widgets = True
+
+    def functions(self) -> list[dict]:
+        return [f for f in FUNCTIONS if self.widgets or f["function"]["name"] != "show_widget"]
 
     async def call(self, name: str, args: dict, ctx: dict) -> str:
         token = purpose_var.set({"show_widget": "widget", "generate_image": "image"}.get(name, purpose_var.get()))
@@ -134,14 +144,39 @@ class Outputs:
 
     # --- widgets -------------------------------------------------------------------
 
+    async def send_widget(self, ctx: dict, html: str, caption: str, ask_bot: bool) -> tuple[dict, int]:
+        """Send to the conversation's topic; where Telegram does not allow widgets there, to the main chat."""
+        params = dict(html=html, caption=caption[:1024] or None, allow_queries=ask_bot or None, chat_id=ctx["chat_id"])
+        thread = ctx["thread_id"] if self.widgets_in_topics else 0
+        try:
+            return await self.bot.api.call("sendWidget", message_thread_id=thread or None, **params), thread
+        except TelegramError as exc:
+            if "NOT_ALLOWED" not in exc.description.upper():
+                raise
+            log.warning("sendWidget not allowed %s", "in a topic" if thread else "in this chat")
+            if not thread:
+                self.widgets = False
+                raise WidgetsUnavailable(exc.description) from None
+            self.widgets_in_topics = False
+        try:
+            return await self.bot.api.call("sendWidget", **params), 0
+        except TelegramError as exc:
+            if "NOT_ALLOWED" in exc.description.upper():
+                self.widgets = False
+                raise WidgetsUnavailable(exc.description) from None
+            raise
+
     async def widget(self, ctx: dict, description: str, caption: str, ask_bot: bool) -> str:
         if not description:
             raise ValueError("description is empty")
+        if not self.widgets:
+            return json.dumps({"error": "Telegram does not allow widgets for this bot or chat yet",
+                               "note": "Do not offer widgets; use Markdown, a poll, an image or a file instead."})
         request = f"Caption: {caption}\nThe widget may message the assistant: {'yes' if ask_bot else 'no'}\n\n{description}"
         messages = [{"role": "system", "content": WIDGET_RULES + "\n" + WIDGET_PROTOCOL}, {"role": "user", "content": request}]
         models = [self.bot.current_model(ctx["chat_id"])]
         models += [m for m in self.bot.models if m not in models and m != "openrouter/auto"][:1]
-        html, sent = "", None
+        html, sent, thread = "", None, ctx["thread_id"]
         for attempt in range(4):
             html = strip_fences(await self.author(messages, models)).replace("\x00", "")
             size, packed = len(html.encode("utf-8")), compressed_size(html)
@@ -149,9 +184,12 @@ class Outputs:
                 problem = f"Too large: {size} bytes, {packed} bytes compressed (limits {MAX_HTML} and {MAX_COMPRESSED})."
             else:
                 try:
-                    sent = await self.bot.api.call("sendWidget", html=html, caption=caption[:1024] or None,
-                                                   allow_queries=ask_bot or None, **self.target(ctx))
+                    sent, thread = await self.send_widget(ctx, html, caption, ask_bot)
                     break
+                except WidgetsUnavailable as exc:
+                    return json.dumps({"error": f"Telegram does not allow widgets here ({exc})",
+                                       "note": "Widgets are still rolling out. Do not offer them again; answer with Markdown, "
+                                               "or a poll, an image or a file if useful."})
                 except TelegramError as exc:
                     log.warning("sendWidget rejected: %s (html %s bytes, %s compressed)", exc.description, size, packed)
                     if "WIDGET" not in exc.description.upper() or attempt == 3:
@@ -165,11 +203,13 @@ class Outputs:
         message_id = sent.get("message_id") if isinstance(sent, dict) else None
         if message_id:
             self.bot.store.run("INSERT INTO widgets(chat_id,thread_id,message_id,caption) VALUES(?,?,?,?)",
-                               (ctx["chat_id"], ctx["thread_id"], message_id, caption))
+                               (ctx["chat_id"], thread, message_id, caption))
         ctx.setdefault("artifacts", []).append(f"[виджет: {caption}]")
-        return json.dumps({"sent": True, "compressed_bytes": compressed_size(html),
-                           "note": "The widget is already in the chat above your answer; do not repeat its content, add a short comment at most."},
-                          ensure_ascii=False)
+        note = "The widget is already in the chat above your answer; do not repeat its content, add a short comment at most."
+        if ctx["thread_id"] and not thread:
+            note = ("Telegram does not allow widgets inside topics yet, so it was sent to the main chat with the bot. "
+                    "Tell the user in one short sentence where to find it.")
+        return json.dumps({"sent": True, "compressed_bytes": compressed_size(html), "note": note}, ensure_ascii=False)
 
     async def author(self, messages: list[dict], models: list[str]) -> str:
         """Write the widget HTML. Room for reasoning plus up to ~32 KB of HTML; another model if the first returns nothing."""

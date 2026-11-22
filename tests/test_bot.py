@@ -581,6 +581,33 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(attempts[0]["allow_queries"])  # the real Api drops None fields
         self.assertIn("INPUT_MEDIA_WIDGET_HTML_INVALID", self.llm.requests[2][-1]["content"])
 
+    async def test_widget_not_allowed_in_topic_goes_to_main_chat_then_tool_is_dropped(self):
+        original, attempts = self.api.call, []
+
+        async def call(method, http_timeout=30, **params):
+            if method == "sendWidget":
+                attempts.append(params.get("message_thread_id"))
+                if params.get("message_thread_id") or self.block_all:
+                    raise TelegramError(method, "Bad Request: INPUT_MEDIA_WIDGET_NOT_ALLOWED")
+            return await original(method, http_timeout, **params)
+        self.api.call, self.block_all = call, False
+        self.llm.script = [Result(tool_calls=[call_tool("show_widget", description="счётчик", caption="Счётчик")]), ("<p>0</p>",), ("Готово",)]
+        await self.bot.on_message(message("Сделай счётчик", 10, thread=77))
+        self.assertEqual(attempts, [77, None])  # one HTML, sent again to the main chat
+        self.assertEqual(len([r for r in self.llm.requests if "You write Telegram widgets" in str(r[0]["content"])]), 1)
+        self.assertIn("main chat", self.llm.requests[-1][-1]["content"])
+        # Next widget in a topic goes straight to the main chat.
+        self.llm.script = [Result(tool_calls=[call_tool("show_widget", description="таймер", caption="Таймер")]), ("<p>t</p>",), ("Ок",)]
+        await self.bot.on_message(message("Таймер", 11, thread=77))
+        self.assertEqual(attempts[-1], None)
+        # Not allowed anywhere: the tool disappears.
+        self.block_all = True
+        self.llm.script = [Result(tool_calls=[call_tool("show_widget", description="x", caption="X")]), ("<p>x</p>",), ("Текстом",)]
+        await self.bot.on_message(message("Ещё", 12))
+        self.assertIn("does not allow widgets", self.llm.requests[-1][-1]["content"])
+        await self.bot.on_message(message("И ещё", 13))
+        self.assertNotIn("show_widget", self.tool_types())
+
     async def test_oversized_widget_is_rewritten_then_rejected(self):
         import os
         big = os.urandom(6000).hex()  # incompressible
