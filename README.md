@@ -90,11 +90,28 @@ Deep link `https://t.me/<бот>?start=q_<base64url вопроса>` откры�
 | `FUSION_MODELS` | DeepSeek V4.1 Flash, GPT-6.2 Sol, Gemini 4 Hydrogen | панель для Fusion; пусто — выключен |
 | `EMBEDDING_MODEL` | `openai/text-embedding-3-small` | поиск по истории, $0,02 за 1 млн токенов |
 | `FALLBACKS` | `on` | `off` — без резервных моделей |
+| `WEB_PORT` | `8000` | порт панели на 127.0.0.1; `0` — выключить |
+| `MINIAPP_URL` | из старого `TELEGRAM_WEBAPP_URL` | публичный HTTPS-адрес панели |
 | `SUGGESTIONS` | `on` | `off` — без вопросов под ответом (на 1 запрос меньше) |
 | `SYSTEM_PROMPT` | короткий промпт ассистента | |
 | `MAX_OUTPUT_TOKENS` | 16000 | ответ вместе с рассуждениями; в режиме «глубоко» — вдвое больше; при нехватке — повтор с короткими рассуждениями | |
 | `HISTORY_CHARS` | 24000 | |
 | `BOT_DB` | `data/bot.sqlite3` | |
+
+## Mini App (панель)
+
+Бот сам отдаёт панель на `127.0.0.1:8000` (`WEB_PORT`; `0` — выключить): модель и рассуждения,
+напоминания и фоновые задачи с отменой, расходы, поиск по памяти. Каждый запрос проверяется по
+подписи Telegram `initData` (HMAC от токена бота, не старше 24 часов) и только для владельца.
+
+Нужен публичный HTTPS. Если на сервере осталась HTTPS-настройка старого cumulative-agent
+(nginx-сайт `cumulative-agent-ip` с сертификатом Let's Encrypt на IP, проксирующий на порт 8000),
+установщик сам переносит адрес из `TELEGRAM_WEBAPP_URL` в `MINIAPP_URL`, а бот ставит кнопку меню
+«Панель». Если HTTPS нет, панель выключена; включить её — `sudo bash deploy/enable-ip-https.sh <IP>`
+из ветки `main`, затем `MINIAPP_URL=https://<IP>/app` в `/etc/llm-bot.env`.
+
+Альтернатива на будущее — Telegram Serverless (хостинг Mini App у Telegram), но тогда серверную
+часть пришлось бы переписать на JavaScript: данные бота живут в SQLite на этом сервере.
 
 ## Автодеплой
 

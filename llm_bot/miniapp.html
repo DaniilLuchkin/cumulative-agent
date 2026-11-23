@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Панель</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.4 system-ui, -apple-system, sans-serif; background: var(--tg-theme-secondary-bg-color, #f2f2f7);
+         color: var(--tg-theme-text-color, #000); padding: 12px 16px calc(16px + env(safe-area-inset-bottom)); }
+  nav { display: flex; gap: 6px; margin-bottom: 12px; overflow-x: auto; }
+  nav button { flex: 1; min-width: 0; border: 0; border-radius: 10px; padding: 8px 6px; font: inherit; white-space: nowrap;
+               background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #000); }
+  nav button.on { background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); }
+  section { display: none; } section.on { display: block; }
+  .card { background: var(--tg-theme-bg-color, #fff); border-radius: 12px; padding: 4px 14px; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 0;
+         border-bottom: 1px solid var(--tg-theme-section-separator-color, rgba(0,0,0,.08)); }
+  .row:last-child { border-bottom: 0; }
+  .hint { color: var(--tg-theme-hint-color, #8e8e93); font-size: 13px; }
+  h2 { font-size: 13px; font-weight: 500; text-transform: uppercase; color: var(--tg-theme-section-header-text-color, #6d6d72);
+       margin: 16px 4px 6px; }
+  .pick { border: 0; background: none; color: var(--tg-theme-text-color, #000); font: inherit; width: 100%; text-align: left;
+          display: flex; justify-content: space-between; gap: 8px; padding: 11px 0; }
+  .pick .check { color: var(--tg-theme-link-color, #2481cc); }
+  .seg { display: flex; gap: 6px; padding: 10px 0; }
+  .seg button { flex: 1; border: 1px solid var(--tg-theme-section-separator-color, #ccc); border-radius: 8px; padding: 6px;
+                background: none; color: inherit; font: inherit; }
+  .seg button.on { border-color: var(--tg-theme-link-color, #2481cc); color: var(--tg-theme-link-color, #2481cc); }
+  .x { border: 0; background: none; color: var(--tg-theme-destructive-text-color, #e53935); font: inherit; }
+  input { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--tg-theme-section-separator-color, #ccc);
+          background: var(--tg-theme-bg-color, #fff); color: inherit; font: inherit; margin-bottom: 10px; }
+  .num { font-variant-numeric: tabular-nums; }
+  #error { color: var(--tg-theme-destructive-text-color, #e53935); }
+</style>
+</head>
+<body>
+<nav>
+  <button data-tab="settings" class="on">Модель</button>
+  <button data-tab="tasks">Задачи</button>
+  <button data-tab="usage">Расходы</button>
+  <button data-tab="memory">Память</button>
+</nav>
+<p id="error"></p>
+
+<section id="settings" class="on">
+  <h2>Модель</h2><div class="card" id="models"></div>
+  <h2>Рассуждения</h2><div class="card"><div class="seg" id="reasoning"></div>
+    <p class="hint">«Глубоко» — модель думает дольше и дороже; ход рассуждений виден под ответом.</p></div>
+  <h2>Прочее</h2><div class="card" id="misc"></div>
+</section>
+<section id="tasks"><h2>Напоминания</h2><div class="card" id="reminders"></div><h2>Фоновые задачи</h2><div class="card" id="watches"></div></section>
+<section id="usage"><h2>Потрачено</h2><div class="card" id="periods"></div><h2>За 30 дней — на что</h2><div class="card" id="purposes"></div></section>
+<section id="memory"><h2>Поиск по прошлым разговорам</h2><input id="q" placeholder="о чём был разговор…" enterkeyhint="search"><div id="hits"></div></section>
+
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+tg && tg.ready(); tg && tg.expand();
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const REASONING = {auto: "Авто", low: "Быстро", high: "Глубоко"};
+const PURPOSES = {chat: "Ответы", utility: "Подсказки и названия", widget: "Виджеты", image: "Картинки", voice: "Голос",
+                  memory: "Поиск по истории", watch: "Фоновые задачи", inline: "Inline и Guest", secretary: "Секретарь"};
+
+async function api(path, body) {
+  const response = await fetch("api/" + path, {method: body ? "POST" : "GET",
+    headers: {"Authorization": "tma " + (tg ? tg.initData : ""), "Content-Type": "application/json"}, body: body ? JSON.stringify(body) : undefined});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error === "unauthorized" ? "Откройте панель из чата с ботом." : data.error);
+  $("error").textContent = "";
+  return data;
+}
+const fail = (e) => { $("error").textContent = e.message; };
+
+function renderState(s) {
+  $("models").innerHTML = s.models.map((m) => `<button class="pick" data-model="${esc(m.id)}"><span>${esc(m.id.split("/").pop())}
+    <span class="hint">${m.price ? "$" + m.price[0].toFixed(2) + " / $" + m.price[1].toFixed(2) : ""}</span></span>
+    <span class="check">${m.id === s.model ? "✓" : ""}</span></button>`).join("");
+  $("reasoning").innerHTML = Object.entries(REASONING).map(([k, v]) => `<button data-level="${k}" class="${k === s.reasoning ? "on" : ""}">${v}</button>`).join("");
+  $("misc").innerHTML = `<div class="row"><span>Часовой пояс</span><span class="hint">${esc(s.timezone)}</span></div>
+    <div class="row"><span>Виджеты</span><span class="hint">${s.widgets ? "доступны" : "закрыты Telegram"}</span></div>
+    <div class="row"><span>Секретарь</span><span class="hint">${s.secretary ? "включён" : "выключен"}</span></div>`;
+}
+function renderTasks(t) {
+  const row = (id, title, meta) => `<div class="row"><span>${esc(title)}<br><span class="hint">${esc(meta)}</span></span><button class="x" data-cancel="${id}">Отменить</button></div>`;
+  const repeat = {daily: ", каждый день", weekdays: ", по будням", weekly: ", каждую неделю"};
+  $("reminders").innerHTML = t.reminders.map((r) => row(r.id, r.text, r.time + (repeat[r.repeat] || ""))).join("") || `<p class="hint">Нет. Скажите боту «напомни…».</p>`;
+  $("watches").innerHTML = t.watches.map((w) => row(w.id, w.title, "каждые " + w.every_hours + " ч")).join("") || `<p class="hint">Нет. Скажите боту «следи за…».</p>`;
+}
+function renderUsage(u) {
+  $("periods").innerHTML = u.periods.map((p) => `<div class="row"><span>${esc(p.label)}</span><span class="num">${p.calls} запр. · $${p.cost.toFixed(4)}</span></div>`).join("");
+  $("purposes").innerHTML = u.purposes.map((p) => `<div class="row"><span>${esc(PURPOSES[p.purpose] || p.purpose)}</span><span class="num">$${p.cost.toFixed(4)}</span></div>`).join("") || `<p class="hint">Пока пусто.</p>`;
+}
+
+document.querySelector("nav").addEventListener("click", (e) => {
+  const tab = e.target.dataset.tab; if (!tab) return;
+  document.querySelectorAll("nav button, section").forEach((el) => el.classList.toggle("on", el.dataset.tab === tab || el.id === tab));
+  if (tab === "tasks") api("tasks").then(renderTasks, fail);
+  if (tab === "usage") api("usage").then(renderUsage, fail);
+});
+$("models").addEventListener("click", (e) => { const b = e.target.closest("[data-model]"); if (b) api("model", {model: b.dataset.model}).then(renderState, fail); });
+$("reasoning").addEventListener("click", (e) => { const b = e.target.closest("[data-level]"); if (b) api("reasoning", {level: b.dataset.level}).then(renderState, fail); });
+document.body.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-cancel]"); if (!b) return;
+  const go = () => api("cancel", {id: b.dataset.cancel}).then(renderTasks, fail);
+  tg && tg.showConfirm ? tg.showConfirm("Отменить?", (ok) => ok && go()) : go();
+});
+$("q").addEventListener("change", () => {
+  const q = $("q").value.trim(); if (!q) return;
+  $("hits").innerHTML = `<p class="hint">Ищу…</p>`;
+  api("search?q=" + encodeURIComponent(q)).then((r) => {
+    $("hits").innerHTML = r.results.map((h) => `<div class="card"><p class="hint">${esc(h.when)} · ${h.who === "user" ? "вы" : "бот"}
+      ${h.topic_link ? `· <a href="${esc(h.topic_link)}">топик</a>` : ""}</p><p>${esc(h.text)}</p></div>`).join("") || `<p class="hint">Ничего похожего.</p>`;
+  }, fail);
+});
+$("hits").addEventListener("click", (e) => {
+  const link = e.target.closest("a"); if (!link || !tg) return;
+  e.preventDefault(); tg.openTelegramLink(link.href);
+});
+api("state").then(renderState, fail);
+</script>
+</body>
+</html>

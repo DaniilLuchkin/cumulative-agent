@@ -76,7 +76,7 @@ SERVICE_KEYS = ("managed_bot_created", "forum_topic_created", "forum_topic_edite
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
 COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("usage", "Расходы на модели"), ("reset", "Очистить контекст"),
             ("settings", "Модель, часовой пояс и локация"), ("location", "Часовой пояс и локация"), ("secretary", "Секретарь (Telegram Business)"),
-            ("bots", "Боты-специалисты"), ("info", "Все возможности бота"), ("help", "Справка")]
+            ("panel", "Панель: модель, задачи, расходы"), ("bots", "Боты-специалисты"), ("info", "Все возможности бота"), ("help", "Справка")]
 # Shown in /settings; override with LLM_MODELS (comma-separated OpenRouter ids).
 DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"]
 DEFAULT_FUSION = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol", "google/gemini-4-hydrogen"]
@@ -126,6 +126,8 @@ class Config:
     tick_seconds: float = 15      # scheduler resolution for reminders and watches
     suggestions: bool = True
     self_settings: bool = True    # setMySettings on start: inline, guest queries, topics with a sidebar
+    web_port: int = 8000          # Mini App server on 127.0.0.1; 0 turns it off
+    miniapp_url: str = ""         # public HTTPS address of the Mini App, e.g. https://203.0.113.5/app
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -147,7 +149,8 @@ class Config:
                    system_prompt=env("SYSTEM_PROMPT") or DEFAULT_PROMPT, allowed_ids=ids, database=env("BOT_DB", cls.database),
                    max_tokens=int(env("MAX_OUTPUT_TOKENS", cls.max_tokens)), history_chars=int(env("HISTORY_CHARS", cls.history_chars)),
                    suggestions=env("SUGGESTIONS", "on").lower() not in ("0", "off", "false", "no"),
-                   self_settings=env("BOT_SELF_SETTINGS", "on").lower() not in ("0", "off", "false", "no"))
+                   self_settings=env("BOT_SELF_SETTINGS", "on").lower() not in ("0", "off", "false", "no"),
+                   web_port=int(env("WEB_PORT", cls.web_port)), miniapp_url=env("MINIAPP_URL", "").strip())
 
 
 class Draft:
@@ -255,6 +258,8 @@ class Bot:
                 await asyncio.sleep(exc.retry_after or 10)
         self.spawn(self.scheduler())
         self.spawn(self.memory.index())  # embeds the backlog once, then only new messages
+        if self.config.web_port and not self.manager_id:
+            await self.start_panel()
         if self.fleet.enabled and not self.manager_id:
             self.fleet.start()
         offset = self.store.get("offset", 0)
@@ -478,6 +483,12 @@ class Bot:
                                 **self._target(chat_id, thread_id, None))
         elif command in ("/location", "/timezone"):
             await self.ask_location(chat_id, thread_id)
+        elif command == "/panel":
+            if self.config.miniapp_url:
+                await self.api.call("sendMessage", chat_id=chat_id, message_thread_id=thread_id or None, text="Панель: модель, задачи, расходы, память.",
+                                    reply_markup={"inline_keyboard": [[{"text": "Открыть панель", "web_app": {"url": self.config.miniapp_url}}]]})
+            else:
+                await self.reply(chat_id, thread_id, "Панель не настроена: нужен HTTPS-адрес сервера (MINIAPP_URL). Подробности — в README.")
         elif command == "/bots":
             await self.fleet.command(argument, chat_id, thread_id)
         elif command == "/secretary":
@@ -953,6 +964,9 @@ class Bot:
 Владелец бота должен включить в @BotFather: inline mode (`/setinline`), inline feedback (`/setinlinefeedback`) и Guest Mode.
 </details>
 
+## 📱 Панель
+- Кнопка **Панель** у поля ввода или `/panel`: модель и рассуждения, напоминания и фоновые задачи с отменой, расходы, поиск по прошлым разговорам.
+
 ## ⚙️ Настройки
 - `/settings` → **Set model**: цены за 1 млн токенов.
 - `/settings` → **Set timezone/location**, или просто пришлите геолокацию (📎 → Геопозиция). Сохраню её и поставлю по ней часовой пояс; без локации — UTC.
@@ -1034,7 +1048,23 @@ class Bot:
                     sent.append(message.get("message_id") if isinstance(message, dict) else None)
         return [m for m in sent if m]
 
+    async def start_panel(self):
+        from .web import Panel
+        self.panel = Panel(self)
+        try:
+            await self.panel.start(self.config.web_port)
+        except OSError as exc:
+            log.warning("mini app server not started: %s", exc)
+            return
+        if self.config.miniapp_url:
+            try:
+                await self.api.call("setChatMenuButton", menu_button={"type": "web_app", "text": "Панель", "web_app": {"url": self.config.miniapp_url}})
+            except TelegramError as exc:
+                log.warning("menu button not set: %s", exc.description)
+
     async def stop(self):
+        if getattr(self, "panel", None):
+            await self.panel.stop()
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)

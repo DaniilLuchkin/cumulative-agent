@@ -159,7 +159,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_and_topics_detected(self):
         self.assertTrue(self.bot.topics_enabled)
         commands = self.api.sent("setMyCommands")[0]
-        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "usage", "reset", "settings", "location", "secretary", "bots", "info", "help"])
+        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "usage", "reset", "settings", "location", "secretary", "panel", "bots", "info", "help"])
 
     async def test_streams_thinking_then_drafts_then_rich_answer_with_reactions(self):
         await self.bot.on_message(message("Как дела?"))
@@ -1029,6 +1029,72 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])
         self.assertEqual(split("x" * 90, 40), ["x" * 40, "x" * 40, "x" * 10])
+
+
+def signed_init_data(token, user_id=123, age=0, tamper=False):
+    import hashlib
+    import hmac
+    from urllib.parse import urlencode
+    fields = {"auth_date": str(int(time.time()) - age), "query_id": "AAH", "user": json.dumps({"id": user_id, "first_name": "Даня"})}
+    check = "\n".join(f"{k}={fields[k]}" for k in sorted(fields))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if tamper:
+        fields["user"] = json.dumps({"id": 1, "first_name": "X"})
+    return urlencode(fields)
+
+
+class MiniAppTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        from llm_bot.web import Panel
+        self.api, self.llm = FakeApi(), FakeLLM()
+        self.bot = Bot(Config(telegram_token="1:secret", openrouter_key="k", database=":memory:", suggestions=False), self.api, self.llm, Store(":memory:"))
+        await self.bot.configure()
+        self.bot.store.set("owner", 123)
+        self.client = TestClient(TestServer(Panel(self.bot).app()))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.bot.store.close()
+
+    def auth(self, **kwargs):
+        return {"Authorization": "tma " + signed_init_data("1:secret", **kwargs)}
+
+    async def test_page_and_security_headers(self):
+        response = await self.client.get("/app")
+        self.assertEqual(response.status, 200)
+        self.assertIn("telegram-web-app.js", await response.text())
+        self.assertIn("frame-ancestors", response.headers["Content-Security-Policy"])
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    async def test_only_fresh_genuine_owner_data_is_accepted(self):
+        self.assertEqual((await self.client.get("/api/state")).status, 401)
+        self.assertEqual((await self.client.get("/api/state", headers=self.auth(tamper=True))).status, 401)
+        self.assertEqual((await self.client.get("/api/state", headers=self.auth(age=2 * 86400))).status, 401)
+        self.assertEqual((await self.client.get("/api/state", headers=self.auth(user_id=999))).status, 401)
+        response = await self.client.get("/api/state", headers=self.auth())
+        self.assertEqual(response.status, 200)
+        state = await response.json()
+        self.assertEqual((state["model"], state["reasoning"], state["timezone"]), ("openrouter/auto", "auto", "UTC"))
+        self.assertEqual(self.bot.store.get("owner"), 123)  # requests from others never change the owner
+
+    async def test_settings_tasks_and_usage(self):
+        state = await (await self.client.post("/api/model", json={"model": "openai/gpt-6.2-sol"}, headers=self.auth())).json()
+        self.assertEqual(state["model"], "openai/gpt-6.2-sol")
+        self.assertEqual((await self.client.post("/api/model", json={"model": "evil/model"}, headers=self.auth())).status, 400)
+        state = await (await self.client.post("/api/reasoning", json={"level": "high"}, headers=self.auth())).json()
+        self.assertEqual(state["reasoning"], "high")
+        self.bot.store.run("INSERT INTO reminders(chat_id,thread_id,text,due_at,repeat) VALUES(123,0,'Позвонить',?, 'none')", (time.time() + 600,))
+        tasks = await (await self.client.get("/api/tasks", headers=self.auth())).json()
+        self.assertEqual(tasks["reminders"][0]["id"], "r1")
+        result = await (await self.client.post("/api/cancel", json={"id": "r1"}, headers=self.auth())).json()
+        self.assertEqual((result["cancelled"], result["reminders"]), (True, []))
+        self.bot.record_usage(123, "chat", "m", 0.01, 10, 5)
+        usage = await (await self.client.get("/api/usage", headers=self.auth())).json()
+        self.assertEqual(usage["periods"][0]["calls"], 1)
+        self.assertEqual(usage["purposes"][0]["purpose"], "chat")
 
 
 class TelegramApiTests(unittest.IsolatedAsyncioTestCase):

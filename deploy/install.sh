@@ -71,6 +71,26 @@ PY
     echo "Settings saved to ${env_file}${ids:+ (allowed user: ${ids})}"
 fi
 
+# Mini App: reuse the HTTPS site of the previous cumulative-agent installation when it exists.
+# Its nginx site proxies https://<ip>/ to 127.0.0.1:8000, where the bot now serves the panel.
+site=/etc/nginx/sites-enabled/cumulative-agent-ip
+cert=/etc/letsencrypt/live/cumulative-agent-ip/fullchain.pem
+if ! grep -q '^MINIAPP_URL=' "${env_file}"; then
+    url=$(env_value TELEGRAM_WEBAPP_URL "${old_env}")
+    if [[ -n ${url} && -e ${site} && -e ${cert} ]]; then
+        echo "MINIAPP_URL=${url}" >> "${env_file}"
+        echo "Mini App: ${url} (HTTPS of the previous installation)"
+    fi
+fi
+miniapp=$(env_value MINIAPP_URL "${env_file}")
+if [[ -n ${miniapp} ]]; then
+    if [[ ! -e ${site} || ! -e ${cert} ]] || ! systemctl is-active --quiet nginx; then
+        echo "Warning: MINIAPP_URL is set but nginx or the certificate is missing; the panel will not open." >&2
+    fi
+else
+    echo "Mini App is off: no HTTPS site found. To enable it, see README (Mini App)."
+fi
+
 # Telegram delivers updates to one poller only. The old agent is stopped, not deleted:
 # its code, settings and database stay in place for a later return.
 if systemctl is-enabled --quiet cumulative-agent 2>/dev/null || systemctl is-active --quiet cumulative-agent 2>/dev/null; then
