@@ -127,7 +127,7 @@ class Agent:
         if self.store.one("SELECT COUNT(*) n FROM watches WHERE chat_id=? AND active=1", (ctx["chat_id"],))["n"] >= MAX_WATCHES:
             raise ValueError(f"at most {MAX_WATCHES} active watches; cancel one first")
         chat_id, thread_id = ctx["chat_id"], ctx["thread_id"]
-        if self.bot.topics_enabled:
+        if self.bot.topics_enabled and chat_id > 0:  # private-chat topics; in groups the watch reports in place
             topic = await self.bot.api.call("createForumTopic", chat_id=chat_id, name=("👁 " + title)[:128])
             thread_id = topic["message_thread_id"]
         watch = self.store.run("INSERT INTO watches(chat_id,thread_id,title,instructions,every_hours,next_at) VALUES(?,?,?,?,?,?)",

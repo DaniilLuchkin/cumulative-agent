@@ -815,6 +815,52 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_message(message("Привет"))
         self.assertTrue(all(d["keep_on_stop"] for d in self.api.sent("sendMessageDraft")))
 
+    # --- groups ---------------------------------------------------------------------
+
+    def group_message(self, text, message_id=50, user=123, **extra):
+        return {"message_id": message_id, "from": {"id": user, "is_bot": False, "first_name": "Даня"},
+                "chat": {"id": -100500, "type": "supergroup"}, "text": text, **extra}
+
+    async def test_group_ask_answers_without_drafts_and_with_context(self):
+        await self.bot.on_message(message("Привет"))  # the owner claims the bot in private
+        quoted = {"message_id": 49, "from": {"id": 777, "first_name": "Оля"}, "text": "Bonjour à tous"}
+        await self.bot.on_message(self.group_message("/ask@test_bot переведи", reply_to_message=quoted))
+        prompt = self.llm.requests[-1]
+        self.assertIn("This is a group chat", prompt[0]["content"])
+        self.assertIn("Сообщение от Оля", prompt[-1]["content"])
+        self.assertTrue(prompt[-1]["content"].endswith("переведи"))
+        answer = self.api.sent("sendRichMessage")[-1]
+        self.assertEqual((answer["chat_id"], answer["reply_parameters"]["message_id"]), (-100500, 50))
+        self.assertFalse([d for d in self.api.sent("sendMessageDraft") if d["chat_id"] < 0])
+        self.assertTrue([a for a in self.api.sent("sendChatAction") if a["chat_id"] == -100500])
+        self.assertEqual(len(self.api.sent("setMyCommands")), 2)  # private and group command lists
+
+    async def test_group_reply_to_bot_continues_and_strangers_are_ignored(self):
+        await self.bot.on_message(message("Привет"))
+        await self.bot.on_message(self.group_message("а подробнее?", 51, reply_to_message={"message_id": 40, "from": {"id": 1, "is_bot": True}}))
+        self.assertEqual(self.llm.requests[-1][-1]["content"], "а подробнее?")
+        before = len(self.llm.requests)
+        await self.bot.on_message(self.group_message("/ask привет", 52, user=999))  # not the owner
+        await self.bot.on_message(self.group_message("просто разговор", 53))   # not addressed to the bot
+        await self.bot.on_message(self.group_message("/ask@other_bot что-то", 54))
+        self.assertEqual(len(self.llm.requests), before)
+
+    async def test_group_help_and_errors_are_ephemeral(self):
+        await self.bot.on_message(message("Привет"))
+        await self.bot.on_message(self.group_message("/help@test_bot", 55))
+        help_text = self.api.sent("sendMessage")[-1]
+        self.assertEqual(help_text["ephemeral_message_parameters"], {"receiver_user_id": 123})
+        self.llm.error = "OpenRouter HTTP 402 Insufficient credits"
+        await self.bot.on_message(self.group_message("/ask вопрос", 56))
+        error = self.api.sent("sendMessage")[-1]
+        self.assertIn("402", error["text"])
+        self.assertEqual(error["ephemeral_message_parameters"], {"receiver_user_id": 123})
+
+    async def test_group_never_claims_the_bot(self):
+        await self.bot.on_message(self.group_message("/ask привет", 57, user=555))
+        self.assertIsNone(self.bot.store.get("owner"))
+        self.assertEqual(self.llm.requests, [])
+
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])
         self.assertEqual(split("x" * 90, 40), ["x" * 40, "x" * 40, "x" * 10])

@@ -83,7 +83,10 @@ INFO_KEYBOARD = {"inline_keyboard": [
 REASONING = {"auto": "авто", "low": "быстро", "high": "глубоко"}
 PURPOSES = {"chat": "Ответы", "utility": "Подсказки и названия", "widget": "Виджеты", "image": "Картинки", "voice": "Голос",
             "memory": "Поиск по истории", "watch": "Фоновые задачи", "inline": "Inline и Guest"}
-BOT_SETTINGS = {"supports_inline_queries": True, "inline_query_placeholder": "вопрос…", "inline_feedback_share_denominator": 1,
+GROUP_COMMANDS = [("ask", "Спросить бота"), ("reset", "Забыть разговор в группе"), ("help", "Как пользоваться в группе")]
+GROUP_PROMPT = ("This is a group chat: other members read your answers. Answer the person who asked, briefly. "
+                "Never reveal the owner's private data, memory or earlier private conversations here.")
+BOT_SETTINGS = {"can_join_groups": True, "supports_inline_queries": True, "inline_query_placeholder": "вопрос…", "inline_feedback_share_denominator": 1,
                 "supports_guest_queries": True, "has_topics_enabled": True, "allows_users_to_create_topics": True,
                 "has_topic_sidebar": True}
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
@@ -157,6 +160,14 @@ class Draft:
     async def push(self):
         if not self.enabled:
             return
+        if self.chat_id < 0:
+            # Drafts exist in private chats only; groups see "typing…" (it lasts about 5 seconds).
+            self.shown, self.last = self.state(), time.monotonic()
+            try:
+                await self.bot.api.call("sendChatAction", chat_id=self.chat_id, action="typing", message_thread_id=self.thread_id or None)
+            except TelegramError:
+                pass
+            return
         params = {"chat_id": self.chat_id, "draft_id": self.draft_id, "can_stop": True, "keep_on_stop": True}
         if self.thread_id:
             params["message_thread_id"] = self.thread_id
@@ -183,14 +194,15 @@ class Draft:
         await self.push()  # empty text = "Thinking…" placeholder
         while True:
             await asyncio.sleep(self.bot.config.draft_interval)
-            if self.state() != self.shown or time.monotonic() - self.last >= self.bot.config.draft_keepalive:
+            keepalive = 4 if self.chat_id < 0 else self.bot.config.draft_keepalive
+            if (self.chat_id > 0 and self.state() != self.shown) or time.monotonic() - self.last >= keepalive:
                 await self.push()
 
 
 class Bot:
     def __init__(self, config: Config, api: Api, llm, store: Store):
         self.config, self.api, self.llm, self.store = config, api, llm, store
-        self.topics_enabled, self.username = False, None
+        self.topics_enabled, self.username, self.bot_id = False, None, None
         self.locks: dict[tuple[int, int], asyncio.Lock] = {}
         self.generations: dict[tuple[int, int], asyncio.Task] = {}
         self.busy: set[tuple[int, int]] = set()
@@ -206,7 +218,7 @@ class Bot:
     async def refresh_topics(self) -> bool:
         """Topic mode is switched in @BotFather; re-read it without a restart."""
         me = await self.api.call("getMe")
-        self.topics_enabled, self.username = bool(me.get("has_topics_enabled")), me.get("username")
+        self.topics_enabled, self.username, self.bot_id = bool(me.get("has_topics_enabled")), me.get("username"), me.get("id")
         return self.topics_enabled
 
     async def configure(self):
@@ -223,6 +235,8 @@ class Bot:
             log.warning("could not load the OpenRouter catalog")
         await self.api.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in COMMANDS],
                             scope={"type": "all_private_chats"})
+        await self.api.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in GROUP_COMMANDS],
+                            scope={"type": "all_group_chats"})
         log.info("started as @%s, topics=%s, model=%s", self.username, self.topics_enabled, self.config.model)
 
     async def run(self):
@@ -285,12 +299,14 @@ class Bot:
 
     # --- access and per-chat settings ----------------------------------------------
 
-    def allowed(self, user_id) -> bool:
+    def allowed(self, user_id, claim: bool = False) -> bool:
+        """Owner check. Only a private message may claim the bot when no allowlist is configured."""
         if type(user_id) is not int:
             return False
         if self.config.allowed_ids:
             return user_id in self.config.allowed_ids
-        self.store.claim_owner(user_id)
+        if claim:
+            self.store.claim_owner(user_id)
         return self.store.get("owner") == user_id
 
     def zone(self, chat_id) -> ZoneInfo:
@@ -319,7 +335,10 @@ class Bot:
 
     async def on_message(self, message: dict):
         chat, user = message.get("chat", {}), message.get("from", {})
-        if chat.get("type") != "private" or user.get("is_bot") or not self.allowed(user.get("id")):
+        if chat.get("type") in ("group", "supergroup"):
+            await self.on_group_message(message)
+            return
+        if chat.get("type") != "private" or user.get("is_bot") or not self.allowed(user.get("id"), claim=True):
             return
         chat_id, thread_id = chat["id"], self.thread_of(message)
         if thread_id:
@@ -350,6 +369,70 @@ class Bot:
             await self.reply(chat_id, thread_id, "Понимаю текст, фото, PDF, текстовые файлы и голосовые сообщения.")
             return
         await self.answer(chat_id, thread_id, content, message["message_id"])
+
+    # --- groups ----------------------------------------------------------------------
+
+    async def on_group_message(self, message: dict):
+        """In groups the bot answers /ask, commands addressed to it and replies to its messages.
+
+        With privacy mode on Telegram delivers only those; anything personal goes as ephemeral
+        messages that only the asker sees."""
+        chat, user = message["chat"], message.get("from", {})
+        if user.get("is_bot") or not self.allowed(user.get("id")) or any(key in message for key in SERVICE_KEYS):
+            return
+        chat_id, thread_id, user_id = chat["id"], self.thread_of(message), user["id"]
+        text = (message.get("text") or message.get("caption") or "").strip()
+        replied = message.get("reply_to_message") or {}
+        mention = "@" + (self.username or "")
+        question = None
+        if text.startswith("/"):
+            head, _, rest = text.partition(" ")
+            name, _, target = head.partition("@")
+            if target and target.lower() != (self.username or "").lower():
+                return  # a command for another bot
+            name = name.lower()
+            if name == "/ask":
+                question = rest.strip()
+            elif name in ("/help", "/start", "/info"):
+                await self.whisper(chat_id, thread_id, user_id,
+                                   "В группе: /ask вопрос — или ответьте на моё сообщение. Если ответить командой /ask на чужое "
+                                   "сообщение, я учту его. /reset — забыть разговор в этой группе. Настройки — в личке со мной.")
+                return
+            elif name == "/reset":
+                self.store.clear(chat_id, thread_id)
+                await self.whisper(chat_id, thread_id, user_id, "Контекст разговора в этой группе очищен.")
+                return
+            else:
+                return
+        elif replied.get("from", {}).get("id") == self.bot_id or (self.username and mention.lower() in text.lower()):
+            question = text.replace(mention, "").strip()
+        else:
+            return
+        context = ""
+        if replied and replied.get("from", {}).get("id") != self.bot_id:
+            quoted = (replied.get("text") or replied.get("caption") or "").strip()
+            if quoted:
+                author = replied.get("from", {}).get("first_name", "участник")
+                context = f"Сообщение от {author}, о котором спрашивают:\n> {quoted[:3000]}\n\n"
+        try:
+            content = await media.read(self, message) if (message.get("photo") or message.get("voice") or message.get("document")) else None
+        except (LLMError, TelegramError) as exc:
+            await self.whisper(chat_id, thread_id, user_id, "Не получилось прочитать вложение: " + str(exc))
+            return
+        if content is None:
+            if not question and not context:
+                await self.whisper(chat_id, thread_id, user_id, "Напишите вопрос после /ask.")
+                return
+            content = media.Input(text=context + (question or "Что скажешь?"))
+        await self.answer(chat_id, thread_id, content, message["message_id"], user_id=user_id)
+
+    async def whisper(self, chat_id: int, thread_id: int, user_id: int, text: str):
+        """An ephemeral message in a group: only user_id sees it."""
+        try:
+            await self.api.call("sendMessage", chat_id=chat_id, message_thread_id=thread_id or None, text=text[:TEXT_LIMIT],
+                                ephemeral_message_parameters={"receiver_user_id": user_id})
+        except TelegramError as exc:
+            log.warning("ephemeral message failed: %s", exc.description)
 
     async def on_command(self, command: str, argument: str, chat_id: int, thread_id: int):
         question = deep_link_question(argument) if command == "/start" else None
@@ -426,6 +509,8 @@ class Bot:
         zone = self.zone(chat_id)
         now = datetime.now(zone).strftime("%A %Y-%m-%d %H:%M")
         content = self.config.system_prompt + "\n" + CONTEXT_PROMPT.format(now=now, zone=zone.key)
+        if chat_id < 0:
+            content += "\n" + GROUP_PROMPT
         model = model or self.current_model(chat_id)
         if model != "openrouter/auto":
             # Models guess their own name from training data; tell them which one actually runs.
@@ -435,17 +520,17 @@ class Bot:
         return {"role": "system", "content": content}
 
     async def answer(self, chat_id: int, thread_id: int, content: media.Input, message_id: int | None,
-                     prefix: str = "", user_row: int | None = None):
+                     prefix: str = "", user_row: int | None = None, user_id: int | None = None):
         # One answer at a time per conversation; later messages wait their turn.
         key = (chat_id, thread_id)
         async with self.locks.setdefault(key, asyncio.Lock()):
             self.busy.add(key)
             try:
-                await self._answer(chat_id, thread_id, content, message_id, prefix, user_row)
+                await self._answer(chat_id, thread_id, content, message_id, prefix, user_row, user_id)
             finally:
                 self.busy.discard(key)
 
-    async def _answer(self, chat_id, thread_id, content, message_id, prefix, user_row):
+    async def _answer(self, chat_id, thread_id, content, message_id, prefix, user_row, user_id=None):
         chat_var.set(chat_id)
         purpose_var.set("chat")
         await self.react(chat_id, message_id, "👀")
@@ -479,7 +564,10 @@ class Bot:
             pusher.cancel()
         if error:
             await self.react(chat_id, message_id, None)
-            await self.reply(chat_id, thread_id, "Не удалось получить ответ: " + error, message_id)
+            if chat_id < 0 and user_id:
+                await self.whisper(chat_id, thread_id, user_id, "Не удалось получить ответ: " + error)
+            else:
+                await self.reply(chat_id, thread_id, "Не удалось получить ответ: " + error, message_id)
             return
         log.info("answered in chat %s topic %s with %s", chat_id, thread_id, getattr(self.llm, "last_model", None) or self.current_model(chat_id))
         result = draft.text.strip()
@@ -811,6 +899,11 @@ class Bot:
 - До 10 задач, проверка не чаще раза в час.
 
 `/tasks` — все напоминания и задачи с кнопками отмены.
+
+## 👥 В группах
+- Добавьте меня в группу. Спросить: `/ask вопрос` или ответьте на моё сообщение. Если ответить командой `/ask` на чужое сообщение, учту его.
+- Отвечаю только вам; подсказки и ошибки вижу только я и вы — это эфемерные сообщения.
+- `/reset` в группе — забыть разговор там. Ваши личные разговоры и память в группе не используются.
 
 ## 🌍 В других чатах
 - `{bot} вопрос` в поле ввода любого чата — ответ появится прямо в отправленном сообщении.
