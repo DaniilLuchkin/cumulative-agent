@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from . import geo, media, outputs
 from .memory import FUNCTION as SEARCH_HISTORY, Memory
+from .secretary import Secretary
 from .agent import Agent
 from .inline import Surfaces
 from .llm import FILE_PLUGIN, SERVER_TOOLS, LLMError, TokenLimit, chat_var, purpose_var
@@ -73,7 +74,8 @@ TOOL_STATUS = {"search_history": "Вспоминаю…", "set_reminder": "Ст�
 SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
 COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("usage", "Расходы на модели"), ("reset", "Очистить контекст"),
-            ("settings", "Модель, часовой пояс и локация"), ("location", "Часовой пояс и локация"), ("info", "Все возможности бота"), ("help", "Справка")]
+            ("settings", "Модель, часовой пояс и локация"), ("location", "Часовой пояс и локация"), ("secretary", "Секретарь (Telegram Business)"),
+            ("info", "Все возможности бота"), ("help", "Справка")]
 # Shown in /settings; override with LLM_MODELS (comma-separated OpenRouter ids).
 DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"]
 DEFAULT_FUSION = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol", "google/gemini-4-hydrogen"]
@@ -82,7 +84,7 @@ INFO_KEYBOARD = {"inline_keyboard": [
     [{"text": "📋 Мои задачи", "callback_data": "cmd:tasks"}, {"text": "💬 Новый диалог", "callback_data": "cmd:new"}]]}
 REASONING = {"auto": "авто", "low": "быстро", "high": "глубоко"}
 PURPOSES = {"chat": "Ответы", "utility": "Подсказки и названия", "widget": "Виджеты", "image": "Картинки", "voice": "Голос",
-            "memory": "Поиск по истории", "watch": "Фоновые задачи", "inline": "Inline и Guest"}
+            "memory": "Поиск по истории", "secretary": "Секретарь", "watch": "Фоновые задачи", "inline": "Inline и Guest"}
 GROUP_COMMANDS = [("ask", "Спросить бота"), ("reset", "Забыть разговор в группе"), ("help", "Как пользоваться в группе")]
 GROUP_PROMPT = ("This is a group chat: other members read your answers. Answer the person who asked, briefly. "
                 "Never reveal the owner's private data, memory or earlier private conversations here.")
@@ -90,7 +92,8 @@ BOT_SETTINGS = {"can_join_groups": True, "supports_inline_queries": True, "inlin
                 "supports_guest_queries": True, "has_topics_enabled": True, "allows_users_to_create_topics": True,
                 "has_topic_sidebar": True}
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
-                   "guest_message", "widget_query", "stopped_message_generation"]
+                   "guest_message", "widget_query", "stopped_message_generation",
+                   "business_connection", "business_message", "deleted_business_messages"]
 
 
 @dataclass
@@ -210,6 +213,7 @@ class Bot:
         self.catalog: dict[str, dict] = {}
         self.models = list(dict.fromkeys([config.model, *config.models]))  # the configured default is always selectable
         self.agent, self.surfaces, self.outputs, self.memory = Agent(self), Surfaces(self), outputs.Outputs(self), Memory(self)
+        self.secretary = Secretary(self)
         if hasattr(llm, "usage_sink"):
             llm.usage_sink = self.record_usage
 
@@ -294,6 +298,12 @@ class Bot:
                 await self.surfaces.on_guest(update["guest_message"])
             elif "widget_query" in update:
                 await self.outputs.on_widget_query(update["widget_query"])
+            elif "business_connection" in update:
+                await self.secretary.on_connection(update["business_connection"])
+            elif "business_message" in update:
+                await self.secretary.on_message(update["business_message"])
+            elif "deleted_business_messages" in update:
+                self.secretary.on_deleted(update["deleted_business_messages"])
         except Exception:
             log.exception("update %s failed", update.get("update_id"))
 
@@ -351,6 +361,10 @@ class Bot:
             return
         if message.get("location"):
             await self.set_location(chat_id, thread_id, message["location"], message.get("message_id"))
+            return
+        if user.get("first_name"):
+            self.store.set("secretary_owner_name", user["first_name"])
+        if message.get("reply_to_message") and await self.secretary.on_owner_reply(message):
             return
         text = (message.get("text") or "").strip()
         command = text.split()[0].split("@")[0].lower() if text.startswith("/") else None
@@ -455,6 +469,8 @@ class Bot:
                                 **self._target(chat_id, thread_id, None))
         elif command in ("/location", "/timezone"):
             await self.ask_location(chat_id, thread_id)
+        elif command == "/secretary":
+            await self.secretary.command(argument, chat_id, thread_id)
         elif command == "/usage":
             await self.send_markdown(chat_id, thread_id, await self.usage_text(), None)
         elif command == "/tasks":
@@ -717,6 +733,8 @@ class Bot:
                 else:
                     self.spawn(self.regenerate(turn))
                     toast = "Пишу заново…"
+            elif data.startswith("sec:"):
+                toast = None if data.startswith("sec:noop") else await self.secretary.on_callback(query, data)
             elif data.startswith("settings:"):
                 toast = await self.settings_action(query, data.removeprefix("settings:"))
             elif data.startswith("cmd:") and data[4:] in ("settings", "tasks", "location", "new"):
@@ -904,6 +922,11 @@ class Bot:
 - Добавьте меня в группу. Спросить: `/ask вопрос` или ответьте на моё сообщение. Если ответить командой `/ask` на чужое сообщение, учту его.
 - Отвечаю только вам; подсказки и ошибки вижу только я и вы — это эфемерные сообщения.
 - `/reset` в группе — забыть разговор там. Ваши личные разговоры и память в группе не используются.
+
+## 🕴 Секретарь (Telegram Business, нужен Premium)
+- `/secretary on` — включить, `/secretary off` — выключить, `/secretary` — состояние. По умолчанию выключен.
+- Подключите меня в Настройки → Telegram Business → Чат-боты. Когда вам пишут, я присылаю сюда черновик ответа: **✅ Отправить**, **✏️ Изменить** или **🙈 Пропустить**. Без вашего нажатия ничего не отправляю.
+- Если вы ответили сами, черновик не приходит. Ответить можно, только если человек писал вам за последние 24 часа.
 
 ## 🌍 В других чатах
 - `{bot} вопрос` в поле ввода любого чата — ответ появится прямо в отправленном сообщении.

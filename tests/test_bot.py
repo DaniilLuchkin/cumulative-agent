@@ -156,7 +156,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_and_topics_detected(self):
         self.assertTrue(self.bot.topics_enabled)
         commands = self.api.sent("setMyCommands")[0]
-        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "usage", "reset", "settings", "location", "info", "help"])
+        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "usage", "reset", "settings", "location", "secretary", "info", "help"])
 
     async def test_streams_thinking_then_drafts_then_rich_answer_with_reactions(self):
         await self.bot.on_message(message("Как дела?"))
@@ -860,6 +860,102 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_message(self.group_message("/ask привет", 57, user=555))
         self.assertIsNone(self.bot.store.get("owner"))
         self.assertEqual(self.llm.requests, [])
+
+    # --- secretary ----------------------------------------------------------------------
+
+    def business(self, text, message_id, sender=777, chat=777, first_name="Оля"):
+        return {"update_id": message_id, "business_message": {"message_id": message_id, "business_connection_id": "bc1",
+                "from": {"id": sender, "first_name": first_name}, "chat": {"id": chat, "type": "private"}, "text": text}}
+
+    async def connect(self, can_reply=True, owner=123):
+        await self.bot.dispatch({"update_id": 1, "business_connection": {"id": "bc1", "user": {"id": owner}, "user_chat_id": owner,
+                                 "date": 0, "is_enabled": True, "rights": {"can_reply": True} if can_reply else {}}})
+
+    async def test_secretary_is_off_until_the_owner_enables_it(self):
+        import llm_bot.secretary as sec
+        sec.DEBOUNCE = 0.01
+        await self.bot.on_message(message("Привет"))
+        await self.connect()
+        await self.bot.dispatch(self.business("Ты завтра свободен?", 5))
+        await self.settle()
+        self.assertEqual(len(self.llm.requests), 1)  # only the private "Привет"
+        await self.bot.on_message(message("/secretary on", 11))
+        self.assertTrue(self.api.sent("setMySettings")[-1]["can_connect_to_business"])
+        self.assertIn("Secretary Mode включён", self.api.sent("sendMessage")[-1]["text"])
+
+    async def test_secretary_drafts_once_per_burst_without_tools_and_sends_on_tap(self):
+        import llm_bot.secretary as sec
+        sec.DEBOUNCE = 0.05
+        await self.bot.on_message(message("Привет"))
+        await self.bot.on_message(message("/secretary on", 11))
+        await self.connect()
+        self.llm.script = [("Да, свободен после шести.",)]
+        await self.bot.dispatch(self.business("Привет!", 5))
+        await self.bot.dispatch(self.business("Ты завтра свободен?", 6))
+        await asyncio.sleep(0.15)
+        await self.settle()
+        drafting = self.llm.requests[-1]
+        self.assertIn("on behalf of", drafting[0]["content"])
+        self.assertEqual([m["role"] for m in drafting], ["system", "user", "user"])
+        self.assertIsNone(self.llm.tools)  # no tools, no web: a contact cannot steer the model into actions
+        card = [m for m in self.api.sent("sendMessage") if "Черновик ответа" in m.get("text", "")]
+        self.assertEqual(len(card), 1)
+        self.assertIn("> Ты завтра свободен?", card[0]["text"])
+        buttons = [b["callback_data"] for b in card[0]["reply_markup"]["inline_keyboard"][0]]
+        self.assertEqual(buttons, ["sec:send:1", "sec:edit:1", "sec:skip:1"])
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "sec:send:1", "message": {"message_id": 5, "chat": {"id": 123}}})
+        sent = [m for m in self.api.sent("sendMessage") if m.get("business_connection_id")]
+        self.assertEqual((sent[-1]["chat_id"], sent[-1]["text"]), (777, "Да, свободен после шести."))
+        self.assertEqual(self.api.sent("answerCallbackQuery")[-1]["text"], "Отправлено")
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "sec:send:1", "message": {"message_id": 5, "chat": {"id": 123}}})
+        self.assertEqual(len([m for m in self.api.sent("sendMessage") if m.get("business_connection_id")]), 1)  # never twice
+
+    async def test_secretary_edit_skip_owner_answer_and_skip_word(self):
+        import llm_bot.secretary as sec
+        sec.DEBOUNCE = 0.02
+        await self.bot.on_message(message("Привет"))
+        await self.bot.on_message(message("/secretary on", 11))
+        await self.connect()
+        self.llm.script = [("Черновик",)]
+        await self.bot.dispatch(self.business("Вопрос", 5))
+        await asyncio.sleep(0.08)
+        await self.settle()
+        await self.bot.on_callback({"id": "q", "from": {"id": 123}, "data": "sec:edit:1", "message": {"message_id": 5, "chat": {"id": 123}}})
+        prompt = self.api.sent("sendMessage")[-1]
+        self.assertTrue(prompt["reply_markup"]["force_reply"])
+        prompt_id = self.api.next_id
+        await self.bot.on_message(message("Мой текст", 12, reply_to_message={"message_id": prompt_id}))
+        sent = [m for m in self.api.sent("sendMessage") if m.get("business_connection_id")]
+        self.assertEqual(sent[-1]["text"], "Мой текст")
+        # The owner answering in the chat cancels the pending draft.
+        calls = len(self.llm.requests)
+        await self.bot.dispatch(self.business("Ещё вопрос", 6))
+        await self.bot.dispatch(self.business("Отвечаю сам", 7, sender=123))
+        await asyncio.sleep(0.08)
+        await self.settle()
+        self.assertEqual(len(self.llm.requests), calls)
+        # SKIP from the model: no card.
+        self.llm.script = [("SKIP",)]
+        cards = len([m for m in self.api.sent("sendMessage") if "Черновик ответа" in m.get("text", "")])
+        await self.bot.dispatch(self.business("👍", 8))
+        await asyncio.sleep(0.08)
+        await self.settle()
+        self.assertEqual(len([m for m in self.api.sent("sendMessage") if "Черновик ответа" in m.get("text", "")]), cards)
+
+    async def test_secretary_ignores_strangers_and_missing_reply_right(self):
+        import llm_bot.secretary as sec
+        sec.DEBOUNCE = 0.02
+        await self.bot.on_message(message("Привет"))
+        await self.bot.on_message(message("/secretary on", 11))
+        await self.connect(owner=999)
+        self.assertIsNone(self.bot.store.one("SELECT * FROM business_connections"))
+        await self.connect(can_reply=False)
+        self.llm.script = [("Черновик",)]
+        await self.bot.dispatch(self.business("Вопрос", 5))
+        await asyncio.sleep(0.08)
+        await self.settle()
+        card = [m for m in self.api.sent("sendMessage") if "Черновик ответа" in m.get("text", "")][-1]
+        self.assertEqual([b["callback_data"] for b in card["reply_markup"]["inline_keyboard"][0]], ["sec:edit:1", "sec:skip:1"])
 
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])
