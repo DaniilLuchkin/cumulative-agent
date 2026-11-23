@@ -104,10 +104,10 @@ Deep link `https://t.me/<бот>?start=q_<base64url вопроса>` откры�
 напоминания и фоновые задачи с отменой, расходы, поиск по памяти. Каждый запрос проверяется по
 подписи Telegram `initData` (HMAC от токена бота, не старше 24 часов) и только для владельца.
 
-Нужен публичный HTTPS. Если на сервере осталась HTTPS-настройка старого cumulative-agent
-(nginx-сайт `cumulative-agent-ip` с сертификатом Let's Encrypt на IP, проксирующий на порт 8000),
-установщик сам переносит адрес из `TELEGRAM_WEBAPP_URL` в `MINIAPP_URL`, а бот ставит кнопку меню
-«Панель». Если HTTPS нет, панель выключена; включить её — `sudo bash deploy/enable-ip-https.sh <IP>`
+Нужен публичный HTTPS. Панель слушает тот же порт 8000, что и старый cumulative-agent, поэтому его HTTPS подходит как есть.
+Установщик находит любой nginx-сайт с `listen 443`, проксирующий на `127.0.0.1:8000`, у которого есть
+сертификат, берёт адрес из `server_name`, записывает `MINIAPP_URL=https://<адрес>/app` и при
+необходимости запускает nginx; бот ставит кнопку меню «Панель». Если HTTPS нет, панель выключена; включить её — `sudo bash deploy/enable-ip-https.sh <IP>`
 из ветки `main`, затем `MINIAPP_URL=https://<IP>/app` в `/etc/llm-bot.env`.
 
 Альтернатива на будущее — Telegram Serverless (хостинг Mini App у Telegram), но тогда серверную

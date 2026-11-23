@@ -71,24 +71,39 @@ PY
     echo "Settings saved to ${env_file}${ids:+ (allowed user: ${ids})}"
 fi
 
-# Mini App: reuse the HTTPS site of the previous cumulative-agent installation when it exists.
-# Its nginx site proxies https://<ip>/ to 127.0.0.1:8000, where the bot now serves the panel.
-site=/etc/nginx/sites-enabled/cumulative-agent-ip
-cert=/etc/letsencrypt/live/cumulative-agent-ip/fullchain.pem
-if ! grep -q '^MINIAPP_URL=' "${env_file}"; then
-    url=$(env_value TELEGRAM_WEBAPP_URL "${old_env}")
-    if [[ -n ${url} && -e ${site} && -e ${cert} ]]; then
-        echo "MINIAPP_URL=${url}" >> "${env_file}"
-        echo "Mini App: ${url} (HTTPS of the previous installation)"
+# Mini App: the bot serves the panel on 127.0.0.1:8000, the port of the previous cumulative-agent.
+# Reuse any nginx HTTPS site that proxies to that port: its server_name gives the public address.
+nginx_sites=${NGINX_SITES:-/etc/nginx/sites-enabled}
+detect_miniapp() {
+    local file name cert
+    for file in "${nginx_sites}"/*; do
+        [[ -f ${file} ]] || continue
+        grep -qE 'proxy_pass[[:space:]]+http://(127\.0\.0\.1|localhost):8000' "${file}" || continue
+        grep -qE 'listen[[:space:]]+[^;]*443' "${file}" || continue
+        name=$(sed -nE 's/^[[:space:]]*server_name[[:space:]]+([^ ;]+).*/\1/p' "${file}" | grep -v '^_$' | tail -n 1)
+        cert=$(sed -nE 's/^[[:space:]]*ssl_certificate[[:space:]]+([^;]+);.*/\1/p' "${file}" | head -n 1)
+        if [[ -n ${name} && -n ${cert} && -e ${cert} ]]; then
+            echo "https://${name}/app"
+            return 0
+        fi
+    done
+    return 1
+}
+miniapp=$(env_value MINIAPP_URL "${env_file}")
+if [[ -z ${miniapp} ]]; then
+    miniapp=$(detect_miniapp || true)
+    if [[ -n ${miniapp} ]]; then
+        sed -i '/^MINIAPP_URL=/d' "${env_file}"
+        echo "MINIAPP_URL=${miniapp}" >> "${env_file}"
+        echo "Mini App: ${miniapp} (nginx HTTPS site of the previous installation, proxied to port 8000)"
     fi
 fi
-miniapp=$(env_value MINIAPP_URL "${env_file}")
 if [[ -n ${miniapp} ]]; then
-    if [[ ! -e ${site} || ! -e ${cert} ]] || ! systemctl is-active --quiet nginx; then
-        echo "Warning: MINIAPP_URL is set but nginx or the certificate is missing; the panel will not open." >&2
+    if ! systemctl is-active --quiet nginx; then
+        systemctl enable --now nginx && echo "Started nginx for the Mini App" || echo "Warning: nginx does not start; the panel will not open." >&2
     fi
 else
-    echo "Mini App is off: no HTTPS site found. To enable it, see README (Mini App)."
+    echo "Mini App is off: no nginx HTTPS site proxies to port 8000. See README (Mini App)."
 fi
 
 # Telegram delivers updates to one poller only. The old agent is stopped, not deleted:
