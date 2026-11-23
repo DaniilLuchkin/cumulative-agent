@@ -79,6 +79,8 @@ class Agent:
             return json.dumps({"error": "arguments are not valid JSON"})
         if name in outputs.NAMES:
             return await self.bot.outputs.call(name, args, ctx)
+        if name == "ask_bot":
+            return await self.bot.fleet.ask(str(args.get("username", "")), str(args.get("question", "")))
         if name == "search_history":
             try:
                 return await self.bot.memory.search(ctx["chat_id"], str(args.get("query", "")), ctx["thread_id"])

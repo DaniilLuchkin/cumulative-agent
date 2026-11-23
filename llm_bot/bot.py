@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from . import geo, media, outputs
 from .memory import FUNCTION as SEARCH_HISTORY, Memory
 from .secretary import Secretary
+from .fleet import Fleet
 from .agent import Agent
 from .inline import Surfaces
 from .llm import FILE_PLUGIN, SERVER_TOOLS, LLMError, TokenLimit, chat_var, purpose_var
@@ -69,13 +70,13 @@ TITLE_PROMPT = ("Name this conversation in 2-5 words in the language of the user
                 "Reply with the title only, no quotes or trailing period.")
 SUGGEST_PROMPT = ("Suggest 3 short follow-up questions the user may ask next, in the user's language, each under 40 characters. "
                   "Reply with a JSON array of strings only.")
-TOOL_STATUS = {"search_history": "Вспоминаю…", "set_reminder": "Ставлю напоминание…", "start_watch": "Запускаю фоновую задачу…",
+TOOL_STATUS = {"ask_bot": "Спрашиваю специалиста…", "search_history": "Вспоминаю…", "set_reminder": "Ставлю напоминание…", "start_watch": "Запускаю фоновую задачу…",
                "list_scheduled": "Смотрю расписание…", "cancel_scheduled": "Отменяю…", **outputs.STATUS}
-SERVICE_KEYS = ("forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
+SERVICE_KEYS = ("managed_bot_created", "forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
                 "general_forum_topic_hidden", "general_forum_topic_unhidden", "pinned_message")
 COMMANDS = [("new", "Новый диалог"), ("tasks", "Напоминания и фоновые задачи"), ("usage", "Расходы на модели"), ("reset", "Очистить контекст"),
             ("settings", "Модель, часовой пояс и локация"), ("location", "Часовой пояс и локация"), ("secretary", "Секретарь (Telegram Business)"),
-            ("info", "Все возможности бота"), ("help", "Справка")]
+            ("bots", "Боты-специалисты"), ("info", "Все возможности бота"), ("help", "Справка")]
 # Shown in /settings; override with LLM_MODELS (comma-separated OpenRouter ids).
 DEFAULT_MODELS = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol"]
 DEFAULT_FUSION = ["deepseek/deepseek-v4.1-flash", "openai/gpt-6.2-sol", "google/gemini-4-hydrogen"]
@@ -93,7 +94,7 @@ BOT_SETTINGS = {"can_join_groups": True, "supports_inline_queries": True, "inlin
                 "has_topic_sidebar": True}
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
                    "guest_message", "widget_query", "stopped_message_generation",
-                   "business_connection", "business_message", "deleted_business_messages"]
+                   "business_connection", "business_message", "deleted_business_messages", "managed_bot"]
 
 
 @dataclass
@@ -213,7 +214,8 @@ class Bot:
         self.catalog: dict[str, dict] = {}
         self.models = list(dict.fromkeys([config.model, *config.models]))  # the configured default is always selectable
         self.agent, self.surfaces, self.outputs, self.memory = Agent(self), Surfaces(self), outputs.Outputs(self), Memory(self)
-        self.secretary = Secretary(self)
+        self.secretary, self.fleet = Secretary(self), Fleet(self)
+        self.manager_id = None  # set when this bot is a specialist run by another bot
         if hasattr(llm, "usage_sink"):
             llm.usage_sink = self.record_usage
 
@@ -253,6 +255,8 @@ class Bot:
                 await asyncio.sleep(exc.retry_after or 10)
         self.spawn(self.scheduler())
         self.spawn(self.memory.index())  # embeds the backlog once, then only new messages
+        if self.fleet.enabled and not self.manager_id:
+            self.fleet.start()
         offset = self.store.get("offset", 0)
         while True:
             try:
@@ -304,6 +308,8 @@ class Bot:
                 await self.secretary.on_message(update["business_message"])
             elif "deleted_business_messages" in update:
                 self.secretary.on_deleted(update["deleted_business_messages"])
+            elif "managed_bot" in update:
+                await self.fleet.on_managed_bot(update["managed_bot"])
         except Exception:
             log.exception("update %s failed", update.get("update_id"))
 
@@ -348,7 +354,10 @@ class Bot:
         if chat.get("type") in ("group", "supergroup"):
             await self.on_group_message(message)
             return
-        if chat.get("type") != "private" or user.get("is_bot") or not self.allowed(user.get("id"), claim=True):
+        if chat.get("type") == "private" and user.get("is_bot"):
+            await self.fleet.on_peer_message(message)  # bot-to-bot, with loop safeguards
+            return
+        if chat.get("type") != "private" or not self.allowed(user.get("id"), claim=True):
             return
         chat_id, thread_id = chat["id"], self.thread_of(message)
         if thread_id:
@@ -469,6 +478,8 @@ class Bot:
                                 **self._target(chat_id, thread_id, None))
         elif command in ("/location", "/timezone"):
             await self.ask_location(chat_id, thread_id)
+        elif command == "/bots":
+            await self.fleet.command(argument, chat_id, thread_id)
         elif command == "/secretary":
             await self.secretary.command(argument, chat_id, thread_id)
         elif command == "/usage":
@@ -758,7 +769,7 @@ class Bot:
 
     def tools_for(self, model: str) -> list[dict]:
         """Function tools, web search, and OpenRouter's model-to-model tools where they make sense for this model."""
-        tools = self.agent.tools() + [SEARCH_HISTORY]
+        tools = self.agent.tools() + [SEARCH_HISTORY] + self.fleet.functions()
         config = self.config
         if config.advisor_model and model != config.advisor_model:
             tools.append({"type": "openrouter:advisor", "parameters": {
@@ -927,6 +938,11 @@ class Bot:
 - `/secretary on` — включить, `/secretary off` — выключить, `/secretary` — состояние. По умолчанию выключен.
 - Подключите меня в Настройки → Telegram Business → Чат-боты. Когда вам пишут, я присылаю сюда черновик ответа: **✅ Отправить**, **✏️ Изменить** или **🙈 Пропустить**. Без вашего нажатия ничего не отправляю.
 - Если вы ответили сами, черновик не приходит. Ответить можно, только если человек писал вам за последние 24 часа.
+
+## 🤖 Боты-специалисты (заготовка, выключено)
+- `/bots on` — включить, `/bots new переводчик` — создать бота-специалиста с этой ролью: я сам заберу его токен и запущу.
+- Специалисту можно писать напрямую, а я могу спросить его сам, когда задача подходит под его роль.
+- Боты отвечают друг другу только текстом, с лимитами и без повторов — чтобы не зациклиться.
 
 ## 🌍 В других чатах
 - `{bot} вопрос` в поле ввода любого чата — ответ появится прямо в отправленном сообщении.

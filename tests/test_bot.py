@@ -1,4 +1,5 @@
 import asyncio
+import pathlib
 import json
 import time
 import unittest
@@ -28,6 +29,8 @@ class FakeApi:
             return {"message_thread_id": 77, "name": params["name"]}
         if method == "getFile":
             return {"file_path": params["file_id"]}
+        if method == "getManagedBotToken":
+            return "999:specialist-token"
         if method == "answerGuestQuery":
             return {"inline_message_id": "guest-1"}
         if method in ("sendMessage", "sendRichMessage", "sendWidget", "sendPoll"):
@@ -156,7 +159,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_and_topics_detected(self):
         self.assertTrue(self.bot.topics_enabled)
         commands = self.api.sent("setMyCommands")[0]
-        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "usage", "reset", "settings", "location", "secretary", "info", "help"])
+        self.assertEqual([c["command"] for c in commands["commands"]], ["new", "tasks", "usage", "reset", "settings", "location", "secretary", "bots", "info", "help"])
 
     async def test_streams_thinking_then_drafts_then_rich_answer_with_reactions(self):
         await self.bot.on_message(message("Как дела?"))
@@ -956,6 +959,72 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.settle()
         card = [m for m in self.api.sent("sendMessage") if "Черновик ответа" in m.get("text", "")][-1]
         self.assertEqual([b["callback_data"] for b in card["reply_markup"]["inline_keyboard"][0]], ["sec:edit:1", "sec:skip:1"])
+
+    # --- managed bots and bot-to-bot ---------------------------------------------------
+
+    def bot_message(self, text, sender, message_id=70):
+        return {"message_id": message_id, "from": {"id": sender, "is_bot": True}, "chat": {"id": sender, "type": "private"}, "text": text}
+
+    async def test_fleet_is_off_by_default_and_bots_are_ignored(self):
+        await self.bot.on_message(message("Привет"))
+        self.assertEqual(self.bot.fleet.functions(), [])
+        await self.bot.on_message(self.bot_message("Привет от бота", 555))
+        self.assertEqual(len(self.llm.requests), 1)
+        self.assertFalse([m for m in self.api.sent("sendMessage") if m["chat_id"] == 555])
+
+    async def test_fleet_creates_a_specialist_and_asks_it(self):
+        started = []
+
+        async def run_child(row):
+            started.append(row["username"])
+        self.bot.fleet.run_child = run_child
+        await self.bot.on_message(message("Привет"))
+        await self.bot.on_message(message("/bots on", 11))
+        self.assertTrue(self.api.sent("setMySettings")[-1]["can_manage_bots"])
+        await self.bot.on_message(message("/bots new переводчик", 12))
+        button = self.api.sent("sendMessage")[-1]["reply_markup"]["keyboard"][0][0]
+        self.assertEqual(button["request_managed_bot"]["suggested_name"], "Переводчик")
+        await self.bot.dispatch({"update_id": 5, "managed_bot": {"user": {"id": 123}, "bot": {"id": 999, "username": "test_tr_bot", "first_name": "T"}}})
+        await self.settle()
+        row = self.bot.store.one("SELECT * FROM managed_bots")
+        self.assertEqual((row["username"], row["role"], row["token"]), ("test_tr_bot", "переводчик", "999:specialist-token"))
+        self.assertEqual(started, ["test_tr_bot"])
+        self.assertIn("ask_bot", [f["function"]["name"] for f in self.bot.fleet.functions()])
+        # ask_bot: the question goes to the specialist; its reply resolves the call.
+        task = asyncio.create_task(self.bot.fleet.ask("test_tr_bot", "Переведи: hello"))
+        await asyncio.sleep(0.01)
+        self.assertEqual(self.api.sent("sendMessage")[-1], {"chat_id": 999, "text": "Переведи: hello"})
+        await self.bot.on_message(self.bot_message("Привет", 999))
+        self.assertEqual(json.loads(await task), {"from": "@test_tr_bot", "answer": "Привет"})
+        # The same question again right away is refused (dedupe / rate limit).
+        self.assertIn("rate limited", await self.bot.fleet.ask("test_tr_bot", "Переведи: hello"))
+        # A strange bot from another creator is not stored.
+        await self.bot.dispatch({"update_id": 6, "managed_bot": {"user": {"id": 555}, "bot": {"id": 1000, "username": "x_bot"}}})
+        self.assertEqual(self.bot.store.one("SELECT COUNT(*) n FROM managed_bots")["n"], 1)
+
+    async def test_specialist_answers_only_its_manager_without_tools(self):
+        self.bot.manager_id = 42
+        await self.bot.on_message(self.bot_message("Что такое SQLite?", 42))
+        self.assertIsNone(self.llm.tools)
+        self.assertEqual(self.api.sent("sendMessage")[-1], {"chat_id": 42, "text": "Привет, **мир**!"})
+        await self.bot.on_message(self.bot_message("Что такое SQLite?", 42, 71))  # duplicate: dropped
+        await self.bot.on_message(self.bot_message("Привет", 43, 72))            # another bot: dropped
+        self.assertEqual(len(self.llm.requests), 1)
+
+    def test_specialist_config_has_role_owner_and_own_database(self):
+        import tempfile
+        self.bot.store.set("owner", 123)
+        self.api.client = None
+        with tempfile.TemporaryDirectory() as folder:
+            self.bot.config.database = folder + "/bot.sqlite3"
+            child = self.bot.fleet.child_bot({"bot_id": 999, "role": "переводчик", "token": "999:t", "username": "t_bot"})
+            self.assertTrue(pathlib.Path(folder, "bot-999.sqlite3").exists())
+            child.store.close()
+        self.assertIn("переводчик", child.config.system_prompt)
+        self.assertNotIn("переводчик", self.bot.config.system_prompt)  # the manager's config is untouched
+        self.assertEqual(child.config.allowed_ids, {123})
+        self.assertFalse(child.config.self_settings)
+        self.assertEqual(child.manager_id, self.bot.bot_id)
 
     def test_split_prefers_paragraphs(self):
         self.assertEqual(split("a" * 30 + "\n\n" + "b" * 30, 40), ["a" * 30, "b" * 30])
