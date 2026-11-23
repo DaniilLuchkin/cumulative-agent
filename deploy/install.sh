@@ -82,9 +82,13 @@ install -d -m 755 "${app}"
 [[ -x ${app}/.venv/bin/python ]] || python3 -m venv "${app}/.venv"
 pip=("${app}/.venv/bin/pip" install --quiet --disable-pip-version-check)
 
-# Test the new release before it replaces the running one.
+# Test the new release before it replaces the running one. The tests are code from the branch:
+# run them as an unprivileged user, never as root.
 "${pip[@]}" "${work}/src"
-if ! (cd "${work}/src" && "${app}/.venv/bin/python" -m unittest discover -s tests >/dev/null 2>"${work}/tests.log"); then
+chmod 755 "${work}" && chmod -R a+rX "${work}/src"
+runner=()
+if id nobody >/dev/null 2>&1 && command -v runuser >/dev/null; then runner=(runuser -u nobody --); fi
+if ! (cd "${work}/src" && "${runner[@]}" env HOME=/tmp PYTHONDONTWRITEBYTECODE=1 "${app}/.venv/bin/python" -m unittest discover -s tests >/dev/null 2>"${work}/tests.log"); then
     tail -n 20 "${work}/tests.log" >&2
     echo "Tests failed for ${commit:0:7}; the running version is kept." >&2
     echo "${commit}" > "${app}/FAILED"

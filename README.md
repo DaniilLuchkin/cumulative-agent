@@ -11,14 +11,14 @@ LLM-агент для Telegram, собранный из возможностей
 | Ответ набирается в реальном времени; кнопка «Стоп» | `sendRichMessageDraft` (`markdown`), `can_stop` → update `stopped_message_generation` |
 | Пока агент работает инструментом — «Ставлю напоминание…» | `sendRichMessageDraft` с `<tg-thinking>` |
 | Итог — Rich Message: таблицы, task lists, `<details>`, сноски | `sendRichMessage`; при ошибке — `sendMessage` частями по 4000 |
-| Под ответом: 3 вопроса для продолжения и «🔄 Перегенерировать» | inline-клавиатура, `editMessageReplyMarkup`; вопросы предлагает `UTILITY_MODEL` |
+| Под ответом: 3 вопроса для продолжения (переписать ответ — исправить свой вопрос) | inline-клавиатура, `editMessageReplyMarkup`; вопросы предлагает `UTILITY_MODEL` |
 | Исправили своё сообщение — ответ переписывается | update `edited_message`, `deleteMessage` старого ответа |
 | «Напомни завтра в 9…» → 🫡, в срок приходит ⏰ с кнопками +15 мин / +1 час / Завтра | tool calling, бот пишет первым; время — `tg://time` (показывается в часовом поясе читателя) |
 | «Следи за …» → отдельный топик 👁 с закреплённым статусом и кнопками «Проверить сейчас / Остановить»; отчёты — в топик, только когда есть новое | `createForumTopic`, `pinChatMessage`, `editMessageText`, веб-поиск `openrouter:web_search` |
 | `/tasks` — напоминания и фоновые задачи с кнопками отмены | inline-клавиатура, правка на месте |
 | Фото, PDF, текстовые файлы, голосовые | `getFile`; фото — vision-модель (если выбранная не умеет, берётся первая из списка, которая умеет); PDF — `file-parser`; голос — `/audio/transcriptions` |
 | Отдельные диалоги в топиках, названия ставит модель | `createForumTopic`, `editForumTopic`, `forum_topic_created.is_name_implicit` |
-| Виджет в сообщении: калькулятор, график, таймер, флеш-карточки, мини-игра — модель решает сама | инструмент `show_widget` → отдельный вызов модели с [официальными правилами Telegram для LLM](https://core.telegram.org/bots/widgets.md#writing-widgets-with-an-llm) пишет HTML; размер проверяется zlib (≤ 4096 байт), при превышении — до 2 переписываний; `sendWidget`. Нажатия с `ask_bot` → `widget_query` → `answerWidgetQuery` и ответ агента в чате |
+| Виджет в сообщении: калькулятор, график, таймер, флеш-карточки, мини-игра — модель решает сама | инструмент `show_widget` → отдельный вызов модели с [официальными правилами Telegram для LLM](https://core.telegram.org/bots/widgets.md#writing-widgets-with-an-llm) пишет HTML; размер проверяется zlib (≤ 4096 байт), при превышении или отказе Telegram — переписывание; `sendWidget`. Нажатия с `ask_bot` → `widget_query` → `answerWidgetQuery` и ответ агента в чате. **С 13.11.2026 Telegram отклоняет виджеты обычных ботов** (`INPUT_MEDIA_WIDGET_NOT_ALLOWED`, [tdlib/telegram-bot-api#947](https://github.com/tdlib/telegram-bot-api/issues/947)): бот запоминает это, убирает инструмент и раз в 6 часов проверяет крошечным виджетом без вызова модели |
 | Опросы и викторины | `create_poll` → `sendPoll` (`type: quiz`, `correct_option_ids`, `explanation`) |
 | Картинки | `generate_image` → OpenRouter `IMAGE_MODEL` (chat completions, `modalities: image`) → `sendPhoto` |
 | Файлы: CSV, JSON, Markdown, код, .ics, .vcf, SVG | `send_file` → `sendDocument` (multipart) |
@@ -100,7 +100,7 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 Установщик ставит таймер `llm-bot-update`: раз в 5 минут сервер проверяет ветку `Alt`
 (`git ls-remote`). Если появился новый коммит, установщик:
 
-1. собирает новую версию и прогоняет тесты; если тесты не прошли, работающая версия остаётся;
+1. собирает новую версию и прогоняет тесты от пользователя `nobody` (код ветки не исполняется от root); если тесты не прошли, работающая версия остаётся;
 2. переключает бота, сохранив предыдущую версию в `/opt/llm-bot/previous`;
 3. ждёт в логе строку `started as @…` до 30 с; если её нет, возвращает предыдущую версию.
 

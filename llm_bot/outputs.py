@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+import time
 import zlib
 from pathlib import Path
 
@@ -23,6 +24,7 @@ THIS BOT
   and the error code on failure. Otherwise never call request().
 - Always render something useful immediately; the widget can be destroyed and recreated at any time."""
 MAX_HTML, MAX_COMPRESSED = 32768, 4096
+PROBE_SECONDS = 6 * 3600
 WIDGET_MAX_TOKENS = 16000
 SAFE_FILE = re.compile(r"^[\w\-. ]{1,64}\.(txt|md|csv|tsv|json|xml|yaml|yml|html|css|js|ts|py|sql|sh|ini|toml|svg|ics|vcf|log)$", re.UNICODE)
 MIME = {"csv": "text/csv", "tsv": "text/tab-separated-values", "json": "application/json", "html": "text/html", "svg": "image/svg+xml",
@@ -104,9 +106,10 @@ class WidgetsUnavailable(Exception):
 class Outputs:
     def __init__(self, bot):
         self.bot = bot
-        # Learned from INPUT_MEDIA_WIDGET_NOT_ALLOWED; widgets are still rolling out (topics: test server only).
+        # Learned from INPUT_MEDIA_WIDGET_NOT_ALLOWED. Since 2026-11-13 Telegram refuses widgets from general
+        # bots (tdlib/telegram-bot-api#947); the state is kept and re-probed every PROBE_SECONDS.
         self.widgets_in_topics = True
-        self.widgets = True
+        self.widgets = not bot.store.get("widgets_blocked_at")
 
     def functions(self) -> list[dict]:
         return [f for f in FUNCTIONS if self.widgets or f["function"]["name"] != "show_widget"]
@@ -155,16 +158,40 @@ class Outputs:
                 raise
             log.warning("sendWidget not allowed %s", "in a topic" if thread else "in this chat")
             if not thread:
-                self.widgets = False
+                self.block_widgets()
                 raise WidgetsUnavailable(exc.description) from None
             self.widgets_in_topics = False
         try:
             return await self.bot.api.call("sendWidget", **params), 0
         except TelegramError as exc:
             if "NOT_ALLOWED" in exc.description.upper():
-                self.widgets = False
+                self.block_widgets()
                 raise WidgetsUnavailable(exc.description) from None
             raise
+
+    def block_widgets(self):
+        self.widgets = False
+        self.bot.store.set("widgets_blocked_at", time.time())
+
+    async def probe_widgets(self, chat_id: int):
+        """A tiny widget, no model call: deleted at once if Telegram accepts it, which re-enables widgets."""
+        blocked = self.bot.store.get("widgets_blocked_at")
+        if not blocked or time.time() - self.bot.store.get("widgets_probed_at", blocked) < PROBE_SECONDS:
+            return
+        self.bot.store.set("widgets_probed_at", time.time())
+        try:
+            sent = await self.bot.api.call("sendWidget", chat_id=chat_id, html="<p>·</p>", disable_notification=True)
+        except TelegramError as exc:
+            log.info("widgets still unavailable: %s", exc.description)
+            return
+        if isinstance(sent, dict) and sent.get("message_id"):
+            try:
+                await self.bot.api.call("deleteMessage", chat_id=chat_id, message_id=sent["message_id"])
+            except TelegramError:
+                pass
+        self.widgets = True
+        self.bot.store.run("DELETE FROM settings WHERE key IN ('widgets_blocked_at','widgets_probed_at')")
+        log.info("widgets are allowed again")
 
     async def widget(self, ctx: dict, description: str, caption: str, ask_bot: bool) -> str:
         if not description:

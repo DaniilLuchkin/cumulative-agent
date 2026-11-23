@@ -163,6 +163,9 @@ class Agent:
 
     async def tick(self):
         now = time.time()
+        owner = self.store.get("owner") or next(iter(self.bot.config.allowed_ids), None)
+        if owner:
+            await self.bot.outputs.probe_widgets(owner)
         for row in self.store.all("SELECT * FROM reminders WHERE active=1 AND due_at<=? ORDER BY due_at LIMIT 20", (now,)):
             await self.deliver_reminder(row)
         for row in self.store.all("SELECT * FROM watches WHERE active=1 AND next_at<=? ORDER BY next_at LIMIT 3", (now,)):

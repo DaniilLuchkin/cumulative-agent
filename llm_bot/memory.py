@@ -1,4 +1,5 @@
 """Semantic search over all past conversations with OpenRouter embeddings."""
+import asyncio
 import json
 import logging
 import math
@@ -16,6 +17,15 @@ FUNCTION = {"type": "function", "function": {
                     "something discussed before that is not in the current context («как мы решили…», «что я говорил про…»)."),
     "parameters": {"type": "object", "required": ["query"], "properties": {
         "query": {"type": "string", "description": "What to look for, as a short phrase"}}}}}
+
+
+def rank(rows: list[tuple[int, bytes]], target: array) -> list[tuple[float, int]]:
+    scored = []
+    for message_id, blob in rows:
+        vector = unpack(blob)
+        if len(vector) == len(target):
+            scored.append((sum(a * b for a, b in zip(vector, target)), message_id))
+    return sorted(scored, reverse=True)
 
 
 def pack(vector: list[float]) -> bytes:
@@ -71,14 +81,9 @@ class Memory:
         finally:
             purpose_var.reset(purpose)
         visible = self.in_context(chat_id, current_thread)
-        scored = []
-        for row in self.store.all("SELECT message_id, vector FROM embeddings WHERE chat_id=?", (chat_id,)):
-            if row["message_id"] in visible:
-                continue  # already in the model's context
-            vector = unpack(row["vector"])
-            if len(vector) == len(target):
-                scored.append((sum(a * b for a, b in zip(vector, target)), row["message_id"]))
-        scored.sort(reverse=True)
+        rows = [(row["message_id"], row["vector"]) for row in self.store.all("SELECT message_id, vector FROM embeddings WHERE chat_id=?", (chat_id,))
+                if row["message_id"] not in visible]  # messages in the model's context are skipped
+        scored = await asyncio.to_thread(rank, rows, target)  # pure Python math: keep the bot responsive
         hits = []
         for score, message_id in scored[:k]:
             row = self.store.one("SELECT thread_id, role, content, created_at FROM messages WHERE id=?", (message_id,))
