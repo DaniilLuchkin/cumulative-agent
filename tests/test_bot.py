@@ -882,6 +882,23 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await router.run([], fallbacks=["b"])).text, "ok")
             self.assertFalse(router.fallbacks_ok)
 
+    async def test_image_uses_the_image_api(self):
+        import base64
+        bodies, urls = [], []
+
+        def handler(request):
+            urls.append(str(request.url))
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(b"\x89PNGdata").decode(), "media_type": "image/png"}],
+                                             "usage": {"cost": 0.05}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router, costs = OpenRouter("k", "m", client), []
+            router.usage_sink = lambda *args: costs.append(args[3])
+            data, mime = await router.image("a fox", "openai/gpt-image-2.6-flare", "1:1")
+        self.assertEqual((data, mime, costs), (b"\x89PNGdata", "image/png", [0.05]))
+        self.assertTrue(urls[0].endswith("/api/v1/images"))
+        self.assertEqual(bodies[0], {"model": "openai/gpt-image-2.6-flare", "prompt": "a fox", "response_format": "b64_json", "aspect_ratio": "1:1"})
+
     async def test_transcription_request(self):
         bodies = []
 

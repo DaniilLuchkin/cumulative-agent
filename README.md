@@ -20,7 +20,7 @@ LLM-агент для Telegram, собранный из возможностей
 | Отдельные диалоги в топиках, названия ставит модель | `createForumTopic`, `editForumTopic`, `forum_topic_created.is_name_implicit` |
 | Виджет в сообщении: калькулятор, график, таймер, флеш-карточки, мини-игра — модель решает сама | инструмент `show_widget` → отдельный вызов модели с [официальными правилами Telegram для LLM](https://core.telegram.org/bots/widgets.md#writing-widgets-with-an-llm) пишет HTML; размер проверяется zlib (≤ 4096 байт), при превышении или отказе Telegram — переписывание; `sendWidget`. Нажатия с `ask_bot` → `widget_query` → `answerWidgetQuery` и ответ агента в чате. **С 13.11.2026 Telegram отклоняет виджеты обычных ботов** (`INPUT_MEDIA_WIDGET_NOT_ALLOWED`, [tdlib/telegram-bot-api#947](https://github.com/tdlib/telegram-bot-api/issues/947)): бот запоминает это, убирает инструмент и раз в 6 часов проверяет крошечным виджетом без вызова модели |
 | Опросы и викторины | `create_poll` → `sendPoll` (`type: quiz`, `correct_option_ids`, `explanation`) |
-| Картинки | `generate_image` → OpenRouter `IMAGE_MODEL` (chat completions, `modalities: image`) → `sendPhoto` |
+| Картинки | `generate_image` → OpenRouter Image API `POST /api/v1/images` (`IMAGE_MODEL`, около $0,05 за картинку) → `sendPhoto` |
 | Файлы: CSV, JSON, Markdown, код, .ics, .vcf, SVG | `send_file` → `sendDocument` (multipart) |
 | Голосовой ответ на голосовое (или по просьбе «ответь голосом») + тот же ответ текстом | OpenRouter `/audio/speech` (`TTS_MODEL`, MP3, голос по языку текста) → `sendVoice`; если озвучка не удалась — только текст |
 | Rich-блоки: формулы, карты, коллажи, сноски, `<details>`, `<aside>`, task lists | системный промпт описывает возможности Rich Markdown |
