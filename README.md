@@ -62,14 +62,12 @@ curl -fsSL https://raw.githubusercontent.com/DaniilLuchkin/cumulative-agent/Alt/
 
 * Настройки: `/etc/llm-bot.env`. После изменения: `sudo systemctl restart llm-bot`.
 * Логи: `journalctl -u llm-bot -f`.
-Настройки в @BotFather:
+Настройки бота бот выставляет сам при запуске через `setMySettings` (Bot API 10.5): inline-режим
+с подсказкой «вопрос…», inline feedback, Guest Mode, топики в личке с созданием топиков пользователем
+и боковой панелью. В @BotFather ничего включать не нужно; `BOT_SELF_SETTINGS=off` отключает это.
+Если Telegram откажет, бот продолжит работу, а в логе будет `setMySettings failed`.
 
-| Что | Где | Без этого |
-|---|---|---|
-| Режим топиков | Mini App → настройки бота | `/new` очищает контекст вместо нового топика; наблюдения пишут в текущий чат |
-| Inline mode | `/setinline` (текст подсказки, например «вопрос…») | `@бот вопрос` не работает |
-| Inline feedback | `/setinlinefeedback` → Enabled | ответ в inline-сообщении не появится (нет `chosen_inline_result`) |
-| Guest Mode | Mini App → настройки бота → Guest Mode | бота нельзя позвать в чат, где его нет |
+Deep link `https://t.me/<бот>?start=q_<base64url вопроса>` открывает бота и сразу задаёт вопрос.
 
 | Переменная | По умолчанию | |
 |---|---|---|

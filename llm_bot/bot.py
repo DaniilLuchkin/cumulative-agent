@@ -42,7 +42,9 @@ DEFAULT_PROMPT = ("You are a helpful personal assistant in a Telegram chat. Repl
                   "||spoiler||, footnotes ([^1] with definitions) for sources, math as $x^2$ or $$...$$ (LaTeX), "
                   "<details><summary>title</summary>...</details> for long optional parts, <aside>quote<cite>author</cite></aside> for pull quotes, "
                   "<tg-map lat=\"55.75\" long=\"37.62\" zoom=\"13\"/> to show a place, an image from a public https URL as its own block "
-                  "![](https://... \"caption\"), several images in <tg-collage> or <tg-slideshow>.\n"
+                  "![](https://... \"caption\"), several images in <tg-collage> or <tg-slideshow>, buttons inside the answer: "
+                  "<tg-button type=\"url\" url=\"https://...\">Open</tg-button> for links and "
+                  "<tg-button type=\"copy_text\" text=\"...\">Copy</tg-button> for codes, addresses and commands.\n"
                   "Tools: set reminders and background watches; search the web for current facts; show_widget for interactive or visual "
                   "content (calculators, charts, timers, flashcards, mini-games); create_poll for polls and quizzes; generate_image for "
                   "pictures; send_file for downloadable text files (CSV, JSON, .ics, code); answer_with_voice when asked to speak; "
@@ -81,6 +83,9 @@ INFO_KEYBOARD = {"inline_keyboard": [
 REASONING = {"auto": "авто", "low": "быстро", "high": "глубоко"}
 PURPOSES = {"chat": "Ответы", "utility": "Подсказки и названия", "widget": "Виджеты", "image": "Картинки", "voice": "Голос",
             "memory": "Поиск по истории", "watch": "Фоновые задачи", "inline": "Inline и Guest"}
+BOT_SETTINGS = {"supports_inline_queries": True, "inline_query_placeholder": "вопрос…", "inline_feedback_share_denominator": 1,
+                "supports_guest_queries": True, "has_topics_enabled": True, "allows_users_to_create_topics": True,
+                "has_topic_sidebar": True}
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "inline_query", "chosen_inline_result",
                    "guest_message", "widget_query", "stopped_message_generation"]
 
@@ -113,6 +118,7 @@ class Config:
     draft_keepalive: float = 20   # drafts are 30-second previews
     tick_seconds: float = 15      # scheduler resolution for reminders and watches
     suggestions: bool = True
+    self_settings: bool = True    # setMySettings on start: inline, guest queries, topics with a sidebar
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -133,7 +139,8 @@ class Config:
                    tts_voice_en=env("TTS_VOICE_EN") or cls.tts_voice_en, timezone=env("TIMEZONE") or cls.timezone,
                    system_prompt=env("SYSTEM_PROMPT") or DEFAULT_PROMPT, allowed_ids=ids, database=env("BOT_DB", cls.database),
                    max_tokens=int(env("MAX_OUTPUT_TOKENS", cls.max_tokens)), history_chars=int(env("HISTORY_CHARS", cls.history_chars)),
-                   suggestions=env("SUGGESTIONS", "on").lower() not in ("0", "off", "false", "no"))
+                   suggestions=env("SUGGESTIONS", "on").lower() not in ("0", "off", "false", "no"),
+                   self_settings=env("BOT_SELF_SETTINGS", "on").lower() not in ("0", "off", "false", "no"))
 
 
 class Draft:
@@ -150,7 +157,7 @@ class Draft:
     async def push(self):
         if not self.enabled:
             return
-        params = {"chat_id": self.chat_id, "draft_id": self.draft_id, "can_stop": True}
+        params = {"chat_id": self.chat_id, "draft_id": self.draft_id, "can_stop": True, "keep_on_stop": True}
         if self.thread_id:
             params["message_thread_id"] = self.thread_id
         text, status = self.text, self.status
@@ -203,6 +210,12 @@ class Bot:
         return self.topics_enabled
 
     async def configure(self):
+        if self.config.self_settings:
+            # Bot API 10.5: the bot enables what the features need instead of manual @BotFather steps.
+            try:
+                await self.api.call("setMySettings", **BOT_SETTINGS)
+            except TelegramError as exc:
+                log.warning("setMySettings failed, configure the bot in @BotFather: %s", exc.description)
         await self.refresh_topics()
         try:
             self.catalog = await self.llm.catalog()
@@ -339,7 +352,11 @@ class Bot:
         await self.answer(chat_id, thread_id, content, message["message_id"])
 
     async def on_command(self, command: str, argument: str, chat_id: int, thread_id: int):
-        if command in ("/start", "/help"):
+        question = deep_link_question(argument) if command == "/start" else None
+        if question:
+            # t.me/<bot>?start=q_<base64url> opens the bot and asks right away.
+            await self.answer(chat_id, thread_id, media.Input(text=question), None, prefix=f"> {question}\n\n")
+        elif command in ("/start", "/help"):
             topics = "/new — новый диалог в отдельном топике.\n" if self.topics_enabled else "/new — начать диалог заново.\n"
             await self.reply(chat_id, thread_id,
                              "Пишите, присылайте фото, PDF или голосовые — ответ появляется по мере генерации, его можно остановить.\n"
@@ -889,6 +906,24 @@ class Bot:
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+
+
+def deep_link_question(payload: str) -> str | None:
+    """/start payload: q_<base64url text> (Telegram allows A-Z, a-z, 0-9, _ and -, up to 64 characters)."""
+    if not payload.startswith("q_"):
+        return None
+    import base64
+    try:
+        text = base64.urlsafe_b64decode(payload[2:] + "=" * (-len(payload[2:]) % 4)).decode("utf-8").strip()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return text or None
+
+
+def deep_link(username: str, question: str) -> str | None:
+    import base64
+    encoded = base64.urlsafe_b64encode(question.encode("utf-8")).decode().rstrip("=")
+    return f"https://t.me/{username}?start=q_{encoded}" if len(encoded) <= 62 else None
 
 
 def split(text: str, limit: int) -> list[str]:
