@@ -78,7 +78,18 @@ fi
 # address from an earlier version) is re-checked on every update.
 miniapp=$(env_value MINIAPP_URL "${env_file}")
 auto=$(env_value MINIAPP_AUTO "${env_file}")
-if found=$(python3 "${work}/src/deploy/find_miniapp.py" ${NGINX_SITES:-}); then
+# Caddy configs: --config of running caddy processes, a Caddyfile in their working folder, /etc/caddy.
+caddy_args=()
+for pid in $(pgrep -if caddy 2>/dev/null || true); do
+    args=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+    config=$(sed -nE 's/.*(--config|-config)[ =]([^ ]+).*/\2/p' <<<"${args}")
+    [[ -z ${config} ]] && config="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)/Caddyfile"
+    [[ ${config} != /* ]] && config="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)/${config}"
+    [[ -f ${config} ]] && caddy_args+=(--caddy "${config}")
+done
+[[ -f /etc/caddy/Caddyfile ]] && caddy_args+=(--caddy /etc/caddy/Caddyfile)
+old_host=$(env_value TELEGRAM_WEBAPP_URL "${old_env}" | sed -nE 's#https://([^:/]+).*#\1#p')
+if found=$(python3 "${work}/src/deploy/find_miniapp.py" ${NGINX_SITES:-} "${caddy_args[@]}" ${old_host:+--host "${old_host}"}); then
     url=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["url"])' "${found}")
     port=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["port"])' "${found}")
     legacy=$(python3 -c 'import re,sys; print(re.sub(r":\d+/app$", "/app", sys.argv[1]))' "${url}")
@@ -89,12 +100,25 @@ if found=$(python3 "${work}/src/deploy/find_miniapp.py" ${NGINX_SITES:-}); then
         echo "Mini App: ${url} (nginx HTTPS of the previous installation, panel on 127.0.0.1:${port})"
     fi
 fi
+# The panel's port must be free: the previous agent may still hold it, e.g. in a Docker container.
+web_port=$(env_value WEB_PORT "${env_file}")
+web_port=${web_port:-8000}
+holder=$(ss -ltnpH "sport = :${web_port}" 2>/dev/null | grep -o 'users:(("[^"]*' | head -n 1 | cut -d'"' -f2 || true)
+if [[ -n ${holder} && ${holder} != llm-bot && ${holder} != python* ]]; then
+    containers=$(docker ps --filter "publish=${web_port}" --format '{{.Names}}' 2>/dev/null | paste -sd' ' || true)
+    if [[ -n ${containers} ]]; then
+        echo "Warning: port ${web_port} is taken by Docker container(s): ${containers} (the previous cumulative-agent?)." >&2
+        echo "  The panel cannot start until it is free. Stop it: sudo docker stop ${containers} && sudo docker update --restart=no ${containers}" >&2
+    else
+        echo "Warning: port ${web_port} is taken by ${holder}; the panel cannot start there." >&2
+    fi
+fi
 if [[ -n ${miniapp} ]]; then
-    if command -v nginx >/dev/null && ! systemctl is-active --quiet nginx; then
+    if [[ ${#caddy_args[@]} -eq 0 ]] && command -v nginx >/dev/null && ! systemctl is-active --quiet nginx; then
         systemctl enable --now nginx && echo "Started nginx for the Mini App" || echo "Warning: nginx does not start; the panel will not open." >&2
     fi
 else
-    echo "Mini App is off: no nginx HTTPS site proxies to a local port. See README (Mini App)."
+    echo "Mini App is off: no nginx or Caddy HTTPS site proxies to a local port. See README (Mini App)."
 fi
 
 # Telegram delivers updates to one poller only. The old agent is stopped, not deleted:

@@ -1,8 +1,11 @@
-"""Find the public HTTPS address and the local port of an existing Mini App behind nginx.
+"""Find the public HTTPS address and the local port of an existing Mini App behind nginx or Caddy.
 
-Reads nginx site files (sites-enabled and conf.d), splits them into server blocks and picks one
-that terminates TLS (listen ... ssl, with an existing certificate) and proxies to a local port.
-Prints JSON {"url": "https://<server_name>[:<port>]/app", "port": <upstream port>}; exits 1 if none.
+nginx: site files are split into server blocks; one that terminates TLS (listen ... ssl, with an
+existing certificate) and proxies to a local port is picked.
+Caddy: Caddyfiles (--caddy PATH) are split into site blocks; one with an HTTPS address
+(host[:port], https://host[:port]) and a reverse_proxy to a local port is picked. Caddy manages
+its certificates itself.
+Prints JSON {"url": "https://<host>[:<port>]/app", "port": <upstream port>}; exits 1 if none.
 Used by install.sh so the bot's panel listens where the previous cumulative-agent did.
 """
 import json
@@ -60,10 +63,73 @@ def find(paths: list[Path], exists=os.path.exists) -> dict | None:
     return None
 
 
+LOCAL_ADDRESS = re.compile(r"(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)")
+
+
+def caddy_sites(text: str) -> list[tuple[str, str]]:
+    """Top-level (address line, body) pairs of a Caddyfile; global options and snippets skipped."""
+    text = re.sub(r"(?m)(^|\s)#.*$", "", text)
+    sites, depth, header, start = [], 0, "", 0
+    for index, char in enumerate(text):
+        if char == "{":
+            if depth == 0:
+                header, start = text[:index].rsplit("\n", 1)[-1].strip() if "\n" in text[:index] else text[:index].strip(), index + 1
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and header and not header.startswith("("):
+                sites.append((header, text[start:index]))
+    return sites
+
+
+def caddy_candidate(header: str, body: str, fallback_host: str | None = None) -> dict | None:
+    upstream = None
+    for line in body.splitlines():
+        if line.strip().startswith("reverse_proxy"):
+            upstream = LOCAL_ADDRESS.search(line)
+            if upstream:
+                break
+    if not upstream:
+        return None
+    for address in re.split(r"[,\s]+", header):
+        if not address or address.startswith("http://"):
+            continue
+        match = re.fullmatch(r"(?:https://)?([^:/\s]*)(?::(\d+))?(/.*)?", address)
+        if not match:
+            continue
+        host, port = match.group(1) or fallback_host, int(match.group(2) or 443)
+        if host in (None, "", "localhost", "127.0.0.1") or port == 80:
+            continue
+        return {"url": f"https://{host}{'' if port == 443 else f':{port}'}/app", "port": int(upstream.group(1))}
+    return None
+
+
+def find_caddy(paths: list[Path], fallback_host: str | None = None) -> dict | None:
+    for path in paths:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        for header, body in caddy_sites(text):
+            found = caddy_candidate(header, body, fallback_host)
+            if found:
+                return found
+    return None
+
+
 def main() -> int:
-    roots = sys.argv[1:] or ["/etc/nginx/sites-enabled", "/etc/nginx/conf.d"]
-    paths = sorted(p for root in roots for p in Path(root).glob("*") if p.is_file())
-    found = find(paths)
+    args, caddy, host, roots = sys.argv[1:], [], None, []
+    while args:
+        arg = args.pop(0)
+        if arg == "--caddy" and args:
+            caddy.append(Path(args.pop(0)))
+        elif arg == "--host" and args:
+            host = args.pop(0)
+        else:
+            roots.append(arg)
+    roots = roots or ["/etc/nginx/sites-enabled", "/etc/nginx/conf.d"]
+    paths = sorted(p for root in roots if Path(root).is_dir() for p in Path(root).glob("*") if p.is_file())
+    found = find(paths) or find_caddy(caddy, host)
     if not found:
         return 1
     print(json.dumps(found))

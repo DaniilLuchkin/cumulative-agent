@@ -62,6 +62,26 @@ class FindMiniAppTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             self.assertEqual(run(folder).returncode, 1)
 
+    def test_caddy_site_with_custom_port(self):
+        with tempfile.TemporaryDirectory() as folder:
+            caddyfile = Path(folder, "Caddyfile")
+            caddyfile.write_text("{\n  email admin@example.com\n}\n# old agent\n40.233.91.116:9443 {\n  encode gzip\n"
+                                 "  reverse_proxy localhost:8000 {\n    header_up Host {host}\n  }\n}\nhttp://x.y {\n  respond 404\n}\n")
+            empty = Path(folder, "nginx")
+            empty.mkdir()
+            result = subprocess.run(["python3", str(FIND), str(empty), "--caddy", str(caddyfile)], capture_output=True, text=True)
+            self.assertEqual(json.loads(result.stdout), {"url": "https://40.233.91.116:9443/app", "port": 8000})
+
+    def test_caddy_without_host_uses_the_old_host(self):
+        with tempfile.TemporaryDirectory() as folder:
+            caddyfile = Path(folder, "Caddyfile")
+            caddyfile.write_text(":9443 {\n  reverse_proxy 127.0.0.1:8010\n}\n")
+            result = subprocess.run(["python3", str(FIND), str(Path(folder, "none")), "--caddy", str(caddyfile), "--host", "40.233.91.116"],
+                                    capture_output=True, text=True)
+            self.assertEqual(json.loads(result.stdout), {"url": "https://40.233.91.116:9443/app", "port": 8010})
+            result = subprocess.run(["python3", str(FIND), str(Path(folder, "none")), "--caddy", str(caddyfile)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)  # no host known: no guessing
+
     def test_installer_parses(self):
         subprocess.run(["bash", "-n", str(ROOT / "deploy" / "install.sh")], check=True)
 

@@ -64,7 +64,11 @@ class Panel:
         self.runner = web.AppRunner(self.app(), access_log=None)
         await self.runner.setup()
         await web.TCPSite(self.runner, "127.0.0.1", port).start()
-        log.info("mini app listening on 127.0.0.1:%s", port)
+        try:
+            await web.TCPSite(self.runner, "::1", port).start()  # proxies that dial "localhost" may try IPv6 first
+        except OSError:
+            pass
+        log.info("mini app listening on localhost:%s", port)
 
     async def stop(self):
         if self.runner:
