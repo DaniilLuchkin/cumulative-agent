@@ -114,6 +114,10 @@ def find_caddy(paths: list[Path], fallback_host: str | None = None) -> dict | No
             found = caddy_candidate(header, body, fallback_host)
             if found:
                 return found
+            proxies = [line.strip() for line in body.splitlines() if line.strip().startswith("reverse_proxy")]
+            if proxies:
+                # Shown in the installer log: a site that proxies somewhere other than this machine's loopback.
+                print(f"caddy site {header!r} in {path}: {'; '.join(proxies)} (not a local port)", file=sys.stderr)
     return None
 
 

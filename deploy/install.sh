@@ -78,14 +78,18 @@ fi
 # address from an earlier version) is re-checked on every update.
 miniapp=$(env_value MINIAPP_URL "${env_file}")
 auto=$(env_value MINIAPP_AUTO "${env_file}")
-# Caddy configs: --config of running caddy processes, a Caddyfile in their working folder, /etc/caddy.
+# Caddy configs: --config of running caddy processes (also inside containers, read through
+# /proc/<pid>/root), a Caddyfile in their working folder, /etc/caddy.
 caddy_args=()
 for pid in $(pgrep -if caddy 2>/dev/null || true); do
     args=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
     config=$(sed -nE 's/.*(--config|-config)[ =]([^ ]+).*/\2/p' <<<"${args}")
-    [[ -z ${config} ]] && config="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)/Caddyfile"
-    [[ ${config} != /* ]] && config="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)/${config}"
-    [[ -f ${config} ]] && caddy_args+=(--caddy "${config}")
+    cwd=$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)
+    [[ -z ${config} ]] && config="${cwd}/Caddyfile"
+    [[ ${config} != /* ]] && config="${cwd}/${config}"
+    for candidate in "/proc/${pid}/root${config}" "${config}"; do
+        if [[ -f ${candidate} ]]; then caddy_args+=(--caddy "${candidate}"); break; fi
+    done
 done
 [[ -f /etc/caddy/Caddyfile ]] && caddy_args+=(--caddy /etc/caddy/Caddyfile)
 old_host=$(env_value TELEGRAM_WEBAPP_URL "${old_env}" | sed -nE 's#https://([^:/]+).*#\1#p')
@@ -100,17 +104,22 @@ if found=$(python3 "${work}/src/deploy/find_miniapp.py" ${NGINX_SITES:-} "${cadd
         echo "Mini App: ${url} (nginx HTTPS of the previous installation, panel on 127.0.0.1:${port})"
     fi
 fi
-# The panel's port must be free: the previous agent may still hold it, e.g. in a Docker container.
+# The panel's port must be free. Other services may own it (on this server port 8000 belongs to
+# another app), so never stop anything: report the owner and, with no port chosen yet, take a free one.
 web_port=$(env_value WEB_PORT "${env_file}")
-web_port=${web_port:-8000}
-holder=$(ss -ltnpH "sport = :${web_port}" 2>/dev/null | grep -o 'users:(("[^"]*' | head -n 1 | cut -d'"' -f2 || true)
+port_owner() { ss -ltnpH "sport = :$1" 2>/dev/null | grep -o 'users:(("[^"]*' | head -n 1 | cut -d'"' -f2 || true; }
+holder=$(port_owner "${web_port:-8000}")
 if [[ -n ${holder} && ${holder} != llm-bot && ${holder} != python* ]]; then
-    containers=$(docker ps --filter "publish=${web_port}" --format '{{.Names}}' 2>/dev/null | paste -sd' ' || true)
-    if [[ -n ${containers} ]]; then
-        echo "Warning: port ${web_port} is taken by Docker container(s): ${containers} (the previous cumulative-agent?)." >&2
-        echo "  The panel cannot start until it is free. Stop it: sudo docker stop ${containers} && sudo docker update --restart=no ${containers}" >&2
-    else
-        echo "Warning: port ${web_port} is taken by ${holder}; the panel cannot start there." >&2
+    containers=$(docker ps --filter "publish=${web_port:-8000}" --format '{{.Names}}' 2>/dev/null | paste -sd' ' || true)
+    echo "Port ${web_port:-8000} belongs to ${containers:-${holder}}; the panel will not use it." >&2
+    if [[ -z ${web_port} ]]; then
+        for candidate in $(seq 8010 8099); do
+            if [[ -z $(port_owner "${candidate}") ]]; then
+                echo "WEB_PORT=${candidate}" >> "${env_file}"
+                echo "Panel moved to 127.0.0.1:${candidate}; a proxy must forward the Mini App address there." >&2
+                break
+            fi
+        done
     fi
 fi
 if [[ -n ${miniapp} ]]; then
