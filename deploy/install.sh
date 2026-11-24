@@ -29,6 +29,16 @@ work=$(mktemp -d)
 trap 'rm -rf "${work}"' EXIT
 git clone --quiet --depth 1 --branch "${ref}" "${repo}" "${work}/src"
 commit=$(git -C "${work}/src" rev-parse HEAD)
+# Run the installer of the new commit, not this older copy: fixes to installation itself apply now.
+if [[ ${INSTALL_REEXEC:-0} != 1 ]] && ! cmp -s "${BASH_SOURCE[0]:-/dev/null}" "${work}/src/deploy/install.sh"; then
+    fresh=$(mktemp)
+    cp "${work}/src/deploy/install.sh" "${fresh}"
+    rm -rf "${work}"
+    trap - EXIT
+    echo "Running the installer of ${commit:0:7}"
+    exec env INSTALL_REEXEC=1 INSTALL_SELF="${fresh}" bash "${fresh}"
+fi
+[[ -n ${INSTALL_SELF:-} ]] && rm -f "${INSTALL_SELF}"  # bash keeps the open file; the copy is not needed on disk
 
 old_env=/etc/cumulative-agent.env
 old_db=/var/lib/cumulative-agent/agent.sqlite3
