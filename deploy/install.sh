@@ -71,39 +71,30 @@ PY
     echo "Settings saved to ${env_file}${ids:+ (allowed user: ${ids})}"
 fi
 
-# Mini App: the bot serves the panel on 127.0.0.1:8000, the port of the previous cumulative-agent.
-# Reuse any nginx HTTPS site that proxies to that port: its server_name gives the public address.
-nginx_sites=${NGINX_SITES:-/etc/nginx/sites-enabled}
-detect_miniapp() {
-    local file name cert
-    for file in "${nginx_sites}"/*; do
-        [[ -f ${file} ]] || continue
-        grep -qE 'proxy_pass[[:space:]]+http://(127\.0\.0\.1|localhost):8000' "${file}" || continue
-        grep -qE 'listen[[:space:]]+[^;]*443' "${file}" || continue
-        name=$(sed -nE 's/^[[:space:]]*server_name[[:space:]]+([^ ;]+).*/\1/p' "${file}" | grep -v '^_$' | tail -n 1)
-        cert=$(sed -nE 's/^[[:space:]]*ssl_certificate[[:space:]]+([^;]+);.*/\1/p' "${file}" | head -n 1)
-        if [[ -n ${name} && -n ${cert} && -e ${cert} ]]; then
-            echo "https://${name}/app"
-            return 0
-        fi
-    done
-    return 1
-}
+# Mini App: reuse the HTTPS that served the previous cumulative-agent's Mini App. find_miniapp.py
+# reads nginx: the TLS server block that proxies to a local port gives the public address (with its
+# port, e.g. https://<ip>:9443/app) and the port the panel must listen on.
+# An address typed by hand is kept; one written by this script (MINIAPP_AUTO=1, or a port-less
+# address from an earlier version) is re-checked on every update.
 miniapp=$(env_value MINIAPP_URL "${env_file}")
-if [[ -z ${miniapp} ]]; then
-    miniapp=$(detect_miniapp || true)
-    if [[ -n ${miniapp} ]]; then
-        sed -i '/^MINIAPP_URL=/d' "${env_file}"
-        echo "MINIAPP_URL=${miniapp}" >> "${env_file}"
-        echo "Mini App: ${miniapp} (nginx HTTPS site of the previous installation, proxied to port 8000)"
+auto=$(env_value MINIAPP_AUTO "${env_file}")
+if found=$(python3 "${work}/src/deploy/find_miniapp.py" ${NGINX_SITES:-}); then
+    url=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["url"])' "${found}")
+    port=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["port"])' "${found}")
+    legacy=$(python3 -c 'import re,sys; print(re.sub(r":\d+/app$", "/app", sys.argv[1]))' "${url}")
+    if [[ -z ${miniapp} || ${auto} == 1 || ${miniapp} == "${legacy}" ]] && [[ ${miniapp} != "${url}" || $(env_value WEB_PORT "${env_file}") != "${port}" ]]; then
+        sed -i '/^MINIAPP_URL=/d; /^WEB_PORT=/d; /^MINIAPP_AUTO=/d' "${env_file}"
+        printf 'MINIAPP_URL=%s\nWEB_PORT=%s\nMINIAPP_AUTO=1\n' "${url}" "${port}" >> "${env_file}"
+        miniapp=${url}
+        echo "Mini App: ${url} (nginx HTTPS of the previous installation, panel on 127.0.0.1:${port})"
     fi
 fi
 if [[ -n ${miniapp} ]]; then
-    if ! systemctl is-active --quiet nginx; then
+    if command -v nginx >/dev/null && ! systemctl is-active --quiet nginx; then
         systemctl enable --now nginx && echo "Started nginx for the Mini App" || echo "Warning: nginx does not start; the panel will not open." >&2
     fi
 else
-    echo "Mini App is off: no nginx HTTPS site proxies to port 8000. See README (Mini App)."
+    echo "Mini App is off: no nginx HTTPS site proxies to a local port. See README (Mini App)."
 fi
 
 # Telegram delivers updates to one poller only. The old agent is stopped, not deleted:
